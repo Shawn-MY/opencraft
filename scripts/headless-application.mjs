@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { localExecutionCli } from "../packages/session-capabilities/src/execution-cli.ts";
 import { ServerSpacesRuntime } from '../packages/access-control/src/server-spaces-runtime.ts';
 import { ServerSpacesSession } from '../packages/access-control/src/server-spaces-session.ts';
 import { createProjectAutomations } from './project-automations.mjs';
@@ -45,7 +46,7 @@ import { ExecutionLeaseStore } from "../apps/opencraft-daemon/src/execution-leas
 import { ThreadIdentityDatabase } from "../apps/opencraft-daemon/src/thread-identity-database.ts";
 import { observeNativeExecutionProcess } from "../apps/opencraft-daemon/src/native-execution-origin.ts";
 import { createWebSocketExecutionTurnInspector } from "../apps/opencraft-daemon/src/native-execution-inspector.ts";
-import { AgentDriverTransport } from "../apps/opencraft-daemon/src/agent-driver-transport.ts";
+import { AgentDriverTransport, AgentDriverSession } from "../apps/opencraft-daemon/src/agent-driver-transport.ts";
 import { WebSocketTransport } from "../packages/appserver-transport-websocket/src/index.ts";
 import { WebSocket } from 'ws';
 import { readDaemonMachineIdentity } from "../apps/opencraft-daemon/src/machine-identity.ts";
@@ -347,6 +348,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
   let remoteBrowser;
   let observability;
   let turnPush;
+  let connectedExecutionCli;
   let closing = null;
   const close = (update = null) => {
     if (closing !== null) return closing;
@@ -374,7 +376,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       await settle([() => appHostServer?.close()]);
       await settle([() => threadOrchestration?.close(), () => connectorService?.close(), () => actorCollaboration?.close(), () => threadAccess?.close(), () => serverSpaces?.close(), () => threadNotes?.close()]);
       await settle([() => orchestrationStorage.close()]);
-      await settle([() => agent?.close(), async () => (await dshAgent?.catch(() => undefined))?.close(), () => capabilityMcp?.close()]);
+      await settle([() => agent?.close(), async () => (await dshAgent?.catch(() => undefined))?.close(), () => connectedExecutionCli?.close(), () => capabilityMcp?.close()]);
       if (releasePiOwner) await settle([() => releasePiOwner()]);
       await settle([() => executionRecovery?.close(), () => agentIdentity?.close()]);
       // Each writer finishes before the root kernel lock is released. A failed
@@ -592,11 +594,13 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       },
     });
     await capabilityMcp.listen();
+    connectedExecutionCli = await localExecutionCli({directory:join(dataDirectory,"connected-execution-cli"),endpoint:capabilityMcp.cliEndpoint,key:capabilityKey});
     const bridgeSessionMcp=createBridgeSessionMcp(capabilityMcp,
       threadId=>({serverId:conversationExecution.serverForThread(threadId),threadId}),
       session=>capabilities.refresh(session));
     const startAgent = options.startAgentHost ?? startLocalAgentHost;
     const startDsh = () => dshAgent ??= startAgent({
+      executionCli: connectedExecutionCli,
       modelPolicyPath,
       nativePi: !engines.includes("pi"),
       sessionCapabilities: capabilities.scoped(`server:${machineIdentity.machineId}:dsh`),
@@ -637,7 +641,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
     } else if (engines.includes("pi")) {
       releasePiOwner = await lockfile.lock(join(dataDirectory, "pi-owner"), {realpath:false,retries:0});
       const piModels = await createPiModelConfiguration(join(dataDirectory, "models"), join(dataDirectory, "pi"));
-      piEngine = new PiEngine({ modelPolicyPath, ...piModels, executionEnvironment: identity?.executionEnvironment, sessionCapabilities: capabilities.scoped(`server:${machineIdentity.machineId}:pi`), dataDirectory, directory: join(dataDirectory, "pi"), attachmentDirectory: join(dataDirectory, "agent", "attachments"), cwd: options.runtimeDirectory ?? join(root, "runtime") });
+      piEngine = new PiEngine({ executionCli: connectedExecutionCli, modelPolicyPath, ...piModels, executionEnvironment: identity?.executionEnvironment, sessionCapabilities: capabilities.scoped(`server:${machineIdentity.machineId}:pi`), dataDirectory, directory: join(dataDirectory, "pi"), attachmentDirectory: join(dataDirectory, "agent", "attachments"), cwd: options.runtimeDirectory ?? join(root, "runtime") });
       // The in-process standalone mode has the same trusted port. Shared-server
       // deployments attach the independent owner through its descriptor instead.
       piEngine.setOrchestration({ tools: [], call: async (threadId, turnId, callId, name, args, _signal, inputId) => {
@@ -718,7 +722,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
         const transport = new ModelPolicyTransport((() => {
         if (hostId === 'opencraft-server') return new TokenUsageQueryTransport(new MachineIdentityTransport(machineIdentity,'OpenCraft',async () =>
           new AgentDriverTransport(new ExecutionOwnershipTransport(new ModelCapabilityTransport(new ImageModelTransport(new WebSocketTransport({url:agent.resolveWebsocketUrl?await agent.resolveWebsocketUrl():agent.websocketUrl,createSocket:url=>new WebSocket(url)}), new ImageGenerationConfiguration(join(dataDirectory,'models'), new ModelCredentialRepository(join(dataDirectory,'models')))), {read:()=>new ModelConfigurationRepository(join(dataDirectory,'models')).read(),credential:async ref=>(await new ModelCredentialRepository(join(dataDirectory,'models')).resolve(ref))??process.env[ref]}), executionStore, resolveExecutionNative), actorCollaboration,
-            threadId => conversationExecution.serverForHost('opencraft-server', threadId))), usageQueries, actorId => actorStore.get(actorId));
+            threadId => conversationExecution.serverForHost('opencraft-server', threadId), session=>executionCliSourceToken(capabilityKey,session))), usageQueries, actorId => actorStore.get(actorId));
         const remote = remoteServers.get(hostId);
         if (remote) return new MachineIdentityTransport(null, "Codex", () => createSshCodexEngineAdapter(remote, dataDirectory, createThreadMetadata, storageOpened(hostId)));
         if (hostId.startsWith("ssh:")) {
@@ -860,6 +864,9 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       getExecutionHealth: options.getExecutionHealth,
       getHostReadiness: () => codexReadiness ? { "local-codex": codexReadiness.snapshot() } : {},
       createAppServerAccessSession: (context, emit) => createThreadAccessSession("opencraft-server", context, emit),
+      createAppServerDriverSession: emit => new AgentDriverSession(actorCollaboration,
+        threadId => conversationExecution.serverForHost('opencraft-server', threadId), emit,
+        session => executionCliSourceToken(capabilityKey, session)),
       createAppServerQuerySession: emit => new TokenUsageQuerySession(usageQueries, emit, actorId => actorStore.get(actorId)),
       appServerTarget: agent.websocketUrl,
       resolveAppServerTarget: agent.resolveWebsocketUrl,
