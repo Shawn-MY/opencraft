@@ -191,7 +191,11 @@ test("CLI supports a dry run", async (t) => {
   await mkdir(dirname(script), { recursive: true });
   await copyFile(new URL("../../scripts/maintenance/prune-local-runtime.mjs", import.meta.url), script);
   const { stdout } = await execFileAsync(process.execPath, [script], {
-    env: { ...process.env, OPENCRAFT_LOCAL_RUNTIME_ROOTS: join(f.repoRoot, ".local") },
+    env: {
+      ...process.env,
+      OPENCRAFT_LOCAL_RUNTIME_ROOTS: join(f.repoRoot, ".local"),
+      OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT: f.procRoot,
+    },
   });
   assert.match(stdout, /mode=dry-run/);
   assert.match(stdout, /would-remove/);

@@ -280,6 +280,7 @@ async function main() {
   await runRetention({
     roots,
     protectedRoots,
+    procRoot: process.env.OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT || "/proc",
     apply: process.argv.includes("--apply"),
     now: nowArgument ? new Date(nowArgument.slice(6)).getTime() : Date.now(),
   });
