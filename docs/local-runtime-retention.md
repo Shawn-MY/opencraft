@@ -6,8 +6,11 @@ command below only considers immediate child directories whose names end in an
 the newest mtime anywhere in the directory tree as the activity signal and
 removes a directory only when it is at least seven days old and no process
 currently references it through `/proc` `cwd`, `root`, `exe`, `maps`, or open
-file descriptors. Any inability to inspect `/proc` is treated as unknown and
-keeps the directory. Directories containing credential-like files (`.env`,
+file descriptors. Missing process entries (`ENOENT`/`ESRCH`), including absent
+slots on kernel threads or zombies and descriptors closed during inspection,
+are absent references. Permissions and other read failures are unknown and
+keep the directory; failure to enumerate the `/proc` root is also unknown.
+Directories containing credential-like files (`.env`,
 keys, certificates, credentials, tokens) or database files (`.db`, SQLite,
 `-wal`, `-shm`) are also kept and the reason is printed.
 Symbolic links are not followed: a linked child is not a candidate, and links

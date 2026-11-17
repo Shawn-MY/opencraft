@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import {
+import fsPromises, {
   copyFile,
   lstat,
   lutimes,
@@ -13,6 +13,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -211,15 +212,43 @@ for (const slot of slots) {
   });
 }
 
-test("a missing slot on a live process is unknown rather than an exited process", async (t) => {
+for (const slot of slots) {
+  test(`missing proc ${slot} is an absent reference even while the PID exists`, async (t) => {
+    const f = await fixture(t);
+    const path = await f.createRun();
+    const processPath = await createProcess(f);
+    await rm(join(processPath, slot), { recursive: true });
+
+    const result = await f.run({ apply: true });
+
+    assert.equal(result.candidates[0].unknown, false);
+    assert.equal(result.eligible.length, 1);
+    await assertMissing(path);
+  });
+}
+
+test("permission denied reading proc maps keeps directories as unknown", async (t) => {
   const f = await fixture(t);
   const path = await f.createRun();
   const processPath = await createProcess(f);
-  await rm(join(processPath, "cwd"));
+  const read = fsPromises.readFile;
+  // Inject the filesystem error so this also works when tests run as root.
+  t.mock.method(fsPromises, "readFile", async (file, ...args) => {
+    if (file === join(processPath, "maps")) {
+      throw Object.assign(new Error("Permission denied"), { code: "EACCES" });
+    }
+    return read(file, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
 
   const result = await f.run({ apply: true });
 
   assert.equal(result.candidates[0].unknown, true);
+  assert.equal(result.candidates[0].reason, "proc-read-unknown");
   assert.equal(result.eligible.length, 0);
   assert.ok((await lstat(path)).isDirectory());
 });

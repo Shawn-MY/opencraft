@@ -54,18 +54,6 @@ function referencesDirectory(target, path) {
   return target === path || target.startsWith(`${path}/`);
 }
 
-async function processHasExited(error, processPath) {
-  if (error.code !== "ENOENT" && error.code !== "ESRCH") {
-    return false;
-  }
-  try {
-    await lstat(processPath);
-    return false;
-  } catch (processError) {
-    return processError.code === "ENOENT" || processError.code === "ESRCH";
-  }
-}
-
 async function slotReferences(path, processPath, slot) {
   const slotPath = join(processPath, slot);
   if (slot === "maps") {
@@ -119,7 +107,9 @@ export async function processReferences(path, procRoot = "/proc") {
           refs.push({ pid: Number(entry.name), slot, target });
         }
       } catch (error) {
-        if (!(await processHasExited(error, processPath))) {
+        // Kernel threads and zombies can lack slots even while their PID exists.
+        // Missing entries are absent references; unreadable entries are unknown.
+        if (error.code !== "ENOENT" && error.code !== "ESRCH") {
           unknown = true;
         }
       }
