@@ -1,6 +1,7 @@
 import ts from 'typescript';
 import { build } from 'esbuild';
-import { readFileSync, readdirSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -24,8 +25,10 @@ export async function readOwnerMigrations(root, store) {
   // An imported migration list is read from its own module, so owner entry
   // guards and startup side effects (for example Worker-only modules) never run.
   const imported = importedBinding(file, expression);
-  const runtime = join(root, '.runtime'); mkdirSync(runtime, { recursive: true });
-  const scratch = mkdtempSync(join(runtime, 'schema-owner-'));
+  const scratch = mkdtempSync(join(tmpdir(), 'opencraft-schema-owner-'));
+  // The generated module is outside the checkout, so preserve the workspace's
+  // external dependency resolution without putting scratch state in `.runtime`.
+  symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
   try {
     const output = join(scratch, 'owner.mjs');
     await build({ stdin: { contents: imported

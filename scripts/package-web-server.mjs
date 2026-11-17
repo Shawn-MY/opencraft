@@ -4,7 +4,8 @@ import { existsSync as existsSyncEntry, realpathSync as realpathSyncEntry } from
 import { packageBrowserRuntime } from './package-browser-runtime.mjs';
 import { optimizeWebImages } from './optimize-web-images.mjs';
 import { packageWebResources, copyPdfLicenses } from './package-web-resources.mjs';
-import { mkdir, readFile, writeFile, cp, rm, chmod } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, cp, rm, chmod, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -26,6 +27,7 @@ import { normalizeFullRuntimeEngines, packageFullRuntime } from './full-release/
 import { buildGitIdentityRuntime } from './package-git-identity-runtime.mjs';
 import { buildConversationCli } from './build-conversation-cli.mjs';
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const temporaryWebPackagePrefix = () => join(tmpdir(), 'opencraft-web-package-');
 
 export function executionModuleOptions(format) {
   return format === 'esm'
@@ -40,7 +42,7 @@ export async function packageWebServer({ version, webRoot = join(repositoryRoot,
   if (!['daemon', 'headless'].includes(executionProfile) || (!execution && executionProfile !== 'daemon')) throw new Error('Invalid execution profile');
   if (executionProfile === 'headless') await assertHeadlessWebRelease(webRoot);
   if (!semver.valid(version)) throw new Error('Set OPENCRAFT_RELEASE_VERSION to an exact npm version');
-  const directory = resolve(output);
+  const directory = resolve(output ?? await mkdtemp(temporaryWebPackagePrefix()));
   const packageRoot = join(directory, 'package');
   await mkdir(directory, { recursive: true });
   await rm(packageRoot, { recursive: true, force: true });
@@ -234,7 +236,7 @@ export async function packageWebServerFromEnvironment(composition = {}) {
     completeRuntime: process.env.OPENCRAFT_PACKAGE_FULL_RELEASE === '1',
     fullRuntimeEngines: process.env.OPENCRAFT_FULL_RUNTIME_ENGINES?.split(',').map(value => value.trim()).filter(Boolean),
     dryRun: process.env.OPENCRAFT_PACKAGE_DRY_RUN === '1',
-    output: process.env.OPENCRAFT_WEB_PACKAGE_OUTPUT || join(repositoryRoot, '.local/web-packages'), ...composition });
+    output: process.env.OPENCRAFT_WEB_PACKAGE_OUTPUT, ...composition });
 }
 if (process.argv[1] && existsSyncEntry(process.argv[1]) && realpathSyncEntry(process.argv[1]) === realpathSyncEntry(new URL(import.meta.url))) {
   console.log(JSON.stringify(await packageWebServerFromEnvironment(), null, 2));
