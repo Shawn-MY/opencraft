@@ -1,3 +1,4 @@
+import { readBrowserState, makeLegacyBrowserState } from './browser-state-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
@@ -19,11 +20,12 @@ class FixtureService extends RemoteBrowserService {
     this.commands.push({ id, method, input, control, document });
     let p = this.physical.get(id);
     if (method === 'create') {
-      if (!p) this.physical.set(id, p = { width: 1280, height: 720, deviceProfile: 'desktop', url: 'about:blank', memory: randomUUID() });
+      if (!p) this.physical.set(id, p = { width: 1280, height: 720, deviceProfile: 'desktop', url: 'about:blank', document: randomUUID(), memory: randomUUID() });
       Object.assign(p, input); return { ...p, navigation: { url: p.url, title: 'Fixture', isLoading: false } };
     }
     if (method === 'close') { this.physical.delete(id); return; }
     if (!p) throw Object.assign(new Error('Browser page closed'), { code: 'BROWSER_ERROR' });
+    if (method === 'automation' && this.echoAutomation) return { method: input.method, control, document, memory: p.memory };
     if (method === 'navigate') { if (input.url && !['https:', 'http:'].includes(new URL(input.url).protocol)) throw new Error('Unsupported browser URL'); if (!this.pendingNavigation) p.url = input.url ?? 'about:blank'; this.receive({ type: 'navigation', page: id, state: { url: p.url, title: 'Fixture', isLoading: this.pendingNavigation } }); }
     if (method === 'snapshot') return { ...p, navigation: { url: p.url, title: 'Fixture', isLoading: false } };
   }
@@ -74,8 +76,8 @@ test('detach keeps the same live page; restart restores URL/config while explici
     assert.equal(restored.width, 430); assert.equal(restored.deviceProfile, 'iphone');
     await third.call('close'); await third.detach();
     assert.equal(f.service.pages.size, 0);
-    assert.deepEqual(JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8')).pages, []);
-    assert.equal((await stat(join(f.directory, 'remote-browser/tabs.json'))).mode & 0o777, 0o600);
+    assert.deepEqual((await readBrowserState(f.directory)).pages, []);
+    assert.equal((await stat(join(f.directory, 'remote-browser/state.sqlite'))).mode & 0o777, 0o600);
   } finally { await f.close(); }
 });
 
@@ -198,9 +200,9 @@ test('corrupt state fails closed and is preserved instead of being replaced with
     await f.service.load();
     const path = join(f.directory, 'remote-browser/tabs.json'); await writeFile(path, '{broken');
     await f.restart();
-    // restart checkpoints valid state first; corrupt the new instance before its first load.
+    // Frozen legacy sources cannot become writable again after migration.
     await writeFile(path, '{broken');
-    const a = await f.connect('a'); await assert.rejects(a.call('state'), /could not be read/); await a.detach();
+    const a = await f.connect('a'); await assert.rejects(a.call('state'), /changed after migration/); await a.detach();
     assert.equal(await readFile(path, 'utf8'), '{broken');
   } finally { await f.close(); }
 });
@@ -231,14 +233,13 @@ test('legacy about:blank recovery records migrate on read without clearing tab i
     const lease = randomUUID(), first = await f.connect('owner-a');
     await first.call('open', { lease }); await first.detach(); await f.restart();
     const path = join(f.directory, 'remote-browser/tabs.json');
-    const saved = JSON.parse(await readFile(path, 'utf8')); saved.pages[0].url = 'about:blank';
-    await writeFile(path, JSON.stringify(saved));
+    const saved = await makeLegacyBrowserState(f.directory, state => { state.pages[0].url = 'about:blank'; });
     const second = await f.connect('owner-a');
     const restored = await second.call('open', { lease });
     assert.equal(restored.restored, true); assert.equal(restored.navigation.url, 'about:blank');
     assert.equal(f.service.pages.size, 1); assert.equal([...f.service.pages.values()][0].url, null);
     assert.equal(f.service.commands.filter(c => c.method === 'navigate').length, 0);
-    assert.equal(JSON.parse(await readFile(path, 'utf8')).pages[0].id, saved.pages[0].id);
+    assert.equal((await readBrowserState(f.directory)).pages[0].id, saved.pages[0].id);
     await assert.rejects(second.call('navigate', { url: 'file:///tmp/private' }), /Unsupported browser URL/);
     await second.call('navigate', { url: 'https://example.test/recovered' }); await second.detach();
   } finally { await f.close(); }
@@ -259,7 +260,7 @@ test('recovery keeps the saved remote target before navigation commits, then fol
     assert.equal(restored.navigation.url, 'https://example.test/remote-authority');
     assert.equal(restored.navigation.isLoading, true);
     await f.service.persistence;
-    let saved = JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8'));
+    let saved = (await readBrowserState(f.directory));
     assert.equal(saved.pages[0].url, 'https://example.test/remote-authority');
     const record = [...f.service.pages.values()][0];
     f.service.receive({ type: 'navigation', page: record.id, state: { url: 'https://example.test/redirected', isLoading: false } });
@@ -280,7 +281,7 @@ test('accepted close completes after the viewer disconnects before native acknow
     await new Promise(resolve=>setImmediate(resolve)); await f.service.persistence;
     assert.equal(f.service.physical.size, 0, 'native page destroyed');
     assert.equal(f.service.pages.size, 0, 'closed page must stop occupying quota after detach');
-    assert.deepEqual(JSON.parse(await readFile(join(f.directory,'remote-browser/tabs.json'),'utf8')).pages,[]);
+    assert.deepEqual((await readBrowserState(f.directory)).pages,[]);
     await f.restart(); const next = await f.connect('owner');
     await assert.rejects(next.call('open',{lease}), /closed/);
     assert.equal((await next.call('open',{lease:randomUUID()})).restored,false); await next.call('close'); await next.detach();
@@ -298,7 +299,7 @@ test('discard waits for an in-flight create and cannot leave an orphan native pa
     const discarding=control.call('discard',{lease});await new Promise(resolve=>setTimeout(resolve,15));finish();await discarding;await opening;
     await f.service.persistence;
     assert.equal(f.service.pages.size,0);assert.equal(f.service.physical.size,0,'created native page must be retired before discard acknowledges');
-    assert.deepEqual(JSON.parse(await readFile(join(f.directory,'remote-browser/tabs.json'),'utf8')).pages,[]);
+    assert.deepEqual((await readBrowserState(f.directory)).pages,[]);
     await first.detach();await control.detach();
   }finally{finish?.();await f.close()}
 });
@@ -348,14 +349,14 @@ test('failed native destruction remains durably closing and resumes after a serv
     const request = f.service.request.bind(f.service);
     f.service.request = async (id, method, input) => { if (method === 'close') throw new Error('temporary native failure'); return request(id, method, input); };
     await assert.rejects(viewer.call('close'), /temporary/);
-    const saved = JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8'));
+    const saved = (await readBrowserState(f.directory));
     assert.equal(saved.pages[0].closing, true);
     await viewer.detach();
     const reconnect = await f.connect('owner'); await assert.rejects(reconnect.call('open', { lease }), /closed/);
     await reconnect.detach(); await viewer.detach(); await f.restart();
     const state = await f.connect('owner'); await state.call('state');
     await until(() => f.service.pages.size === 0); await f.service.persistence;
-    assert.deepEqual(JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8')).pages, []);
+    assert.deepEqual((await readBrowserState(f.directory)).pages, []);
     await state.detach();
   } finally { await f.close(); }
 });
@@ -375,6 +376,253 @@ test('missing or malformed historical mappings never trigger a sweep of unwatche
 
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+async function dormantServiceTab(service) {
+  const authorize = () => {}, lease = 'browser-' + randomUUID();
+  const { scope } = await service.metadata('owner', undefined, authorize);
+  const scopeId = 'conversation:' + JSON.stringify(['host', 'thread']);
+  const values = { pages: [{ id: 'service-page', ownerId: scopeId, hostId: 'host', entries: [{ url: 'https://example.test/saved' }], index: 0 }],
+    tabs: [{ id: 'service-tab', ownerId: scopeId, pageId: 'service-page' }], storage: { 'service-page': lease } };
+  for (const [key, value] of Object.entries(values)) await service.metadata('owner', { scope, key, value: JSON.stringify(value), expectedKeyRevision: 0, mutationId: randomUUID() }, authorize);
+  return { ownerId: 'owner', lease, scopeId, hostId: 'host', threadId: 'thread', authorize };
+}
+
+test('closing a positively dormant conversation tab does not launch or recreate native', async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service);
+    f.service.start = () => assert.fail('closing a dormant tab launched a Worker');
+    assert.deepEqual(await f.service.closeTab(binding, { tabId: 'service-tab' }), { tabId: 'service-tab', closed: true });
+    assert.equal(f.service.commands.length, 0); assert.equal(f.service.pages.size, 0);
+    assert.equal((await f.service.closeTab(binding, { tabId: 'service-tab' })).closed, true);
+  } finally { await f.close(); }
+});
+
+test('legacy storage removal shares retirement and removes the remaining logical references', async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service), state = await f.service.metadata('owner', undefined, binding.authorize);
+    const retry = f.service.retryRetirement.bind(f.service); f.service.retryRetirement = () => {};
+    await f.service.metadata('owner', { scope: state.scope, key: 'storage', value: '{}', expectedKeyRevision: state.keyRevisions.storage, mutationId: randomUUID() }, binding.authorize);
+    const closed = await f.service.metadata('owner', undefined, binding.authorize);
+    assert.equal(f.service.pages.size, 1, 'logical retirement must be complete before native cleanup starts');
+    assert.deepEqual(JSON.parse(closed.values.pages), []); assert.deepEqual(JSON.parse(closed.values.tabs), []);
+    f.service.retryRetirement = retry; await f.service.retire([...f.service.pages.values()][0]);
+    assert.equal(f.service.pages.size, 0);
+    assert.equal(closed.retiredTabs[0].pageIds[0], 'service-page'); assert.equal(f.service.commands.length, 0);
+  } finally { await f.close(); }
+});
+
+test('Agent close respects human control and a takeover queued ahead of close intent wins', async () => {
+  const f = await fixture(); let release;
+  try {
+    const binding = await dormantServiceTab(f.service); f.service.echoAutomation = true;
+    await f.service.invokeAutomation(binding, 'inspect', {});
+    const viewer = await f.connect('owner'); await viewer.call('open', { lease: binding.lease, multiView: true, visible: true });
+    const human = await viewer.call('control', { action: 'human' });
+    await assert.rejects(f.service.closeTab(binding, { tabId: 'service-tab' }), { code: 'CONTROL_BUSY' });
+    const page = [...f.service.pages.values()][0]; assert.equal(page.controlToken, human.token);
+    await viewer.call('control', { action: 'release', token: human.token });
+    const request = f.service.request.bind(f.service); let started, hold = true;
+    const admitted = new Promise(resolve => { started = resolve; }), gate = new Promise(resolve => { release = resolve; });
+    f.service.request = async (id, method, input, ...rest) => {
+      const result = await request(id, method, input, ...rest);
+      if (method === 'control' && input.token && hold) { hold = false; started(); await gate; }
+      return result;
+    };
+    const closing = f.service.closeTab(binding, { tabId: 'service-tab' });
+    const denied = assert.rejects(closing, { code: 'CONTROL_LOST' }); await admitted;
+    const takeover = viewer.call('control', { action: 'human', takeover: true }); await settle(); release();
+    const winner = await takeover; await denied;
+    assert.equal(page.controlToken, winner.token); assert.equal(page.closing, undefined);
+    assert.equal(await f.service.store.hasRetirement(page.key), false);
+    await viewer.call('control', { action: 'release', token: winner.token });
+    assert.equal((await f.service.closeTab(binding, { tabId: 'service-tab' })).closed, true);
+    await viewer.detach(); assert.equal(f.service.pages.size, 0);
+  } finally { release?.(); await f.close(); }
+});
+
+test('service recovers a dormant tab without a viewer and preserves metadata revisions and saved native configuration', async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service);
+    const metadata = await f.service.metadata('owner', undefined, binding.authorize);
+    f.service.echoAutomation = true;
+    const result = await f.service.invokeAutomation(binding, 'inspect', {});
+    let page = [...f.service.pages.values()][0];
+    assert.equal(result.document, page.document); assert.equal(page.url, 'https://example.test/saved');
+    assert.equal(f.service.viewers(page).size, 0); assert.equal(f.service.sockets.size, 0);
+    assert.equal(f.service.commands.filter(call => call.method === 'create').length, 1);
+    page.zoom = 150; page.viewport = { width: 430, height: 932, deviceProfile: 'iphone' }; await f.service.persist();
+    await f.restart(); f.service.echoAutomation = true;
+    const restored = await f.service.invokeAutomation(binding, 'inspect', {});
+    page = [...f.service.pages.values()][0];
+    assert.notEqual(restored.memory, result.memory); assert.equal(page.url, 'https://example.test/saved');
+    assert.deepEqual(page.viewport, { width: 430, height: 932, deviceProfile: 'iphone' });
+    assert(f.service.commands.some(call => call.method === 'zoom' && call.input.percent === 150));
+    assert.equal(f.service.viewers(page).size, 0);
+    assert.deepEqual(await f.service.metadata('owner', undefined, binding.authorize), metadata);
+    const before = f.service.commands.length;
+    await assert.rejects(f.service.invokeAutomation({ ...binding, threadId: 'foreign' }, 'inspect', {}), { code: 'TAB_ACCESS_DENIED' });
+    assert.equal(f.service.commands.length, before);
+  } finally { await f.close(); }
+});
+
+test('viewer attachment waits for service recovery and adopts the same native page', async () => {
+  const f = await fixture(); let release;
+  try {
+    const binding = await dormantServiceTab(f.service); f.service.echoAutomation = true;
+    const request = f.service.request.bind(f.service); let started;
+    const admitted = new Promise(resolve => { started = resolve; }), gate = new Promise(resolve => { release = resolve; });
+    f.service.request = async (id, method, ...args) => { if (method === 'navigate') { started(); await gate; } return request(id, method, ...args); };
+    const recovery = f.service.invokeAutomation(binding, 'inspect', {}); await admitted;
+    assert.equal([...f.service.pages.values()][0].live, true, 'native create ACK alone is not completed recovery');
+    const concurrentRead = f.service.invokeAutomation(binding, 'inspect', {});
+    const viewer = await f.connect('owner'), attached = viewer.call('open', { lease: binding.lease, multiView: true, initialUrl: 'https://example.test/stale' });
+    await settle(); assert.equal(f.service.commands.some(call => call.method === 'automation'), false); release();
+    const [read, secondRead, config] = await Promise.all([recovery, concurrentRead, attached]);
+    assert.equal(read.memory, config.memory); assert.equal(secondRead.memory, config.memory); assert.equal(config.resumed, true);
+    assert.equal(f.service.commands.filter(call => call.method === 'create').length, 1);
+    assert.deepEqual(f.service.commands.filter(call => call.method === 'navigate').map(call => call.input.url), ['https://example.test/saved']);
+    await viewer.detach(); assert.equal(f.service.attachments.size, 0);
+  } finally { release?.(); await f.close(); }
+});
+
+test('service creation uncertainty is reconciled by snapshot and never replays a native create', async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service); f.service.echoAutomation = true;
+    const request = f.service.request.bind(f.service); let lost = true;
+    f.service.request = async (id, method, ...args) => {
+      const result = await request(id, method, ...args);
+      if (method === 'create' && lost) { lost = false; throw Object.assign(new Error('Lost native acknowledgement'), { code: 'BROWSER_UNAVAILABLE', outcome: 'unknown' }); }
+      return result;
+    };
+    await assert.rejects(f.service.invokeAutomation(binding, 'inspect', {}), { outcome: 'unknown' });
+    assert.equal((await f.service.catalog('owner', binding.authorize)).sessions[0].runtime, 'unknown');
+    await f.service.invokeAutomation(binding, 'inspect', {});
+    assert.equal(f.service.commands.filter(call => call.method === 'create').length, 1);
+    assert.equal(f.service.commands.filter(call => call.method === 'close').length, 0);
+    assert.equal(f.service.viewers([...f.service.pages.values()][0]).size, 0);
+  } finally { await f.close(); }
+});
+
+test('revocation during recovery prevents saved-URL dispatch and queued cancellation cannot create a page', async () => {
+  const f = await fixture(); let releaseCreate;
+  try {
+    const binding = await dormantServiceTab(f.service), key = JSON.stringify([binding.ownerId, binding.lease]);
+    const unlock = await f.service.acquirePageActivation(key), cancelled = new AbortController();
+    const queued = f.service.invokeAutomation(binding, 'inspect', {}, { signal: cancelled.signal });
+    const rejected = assert.rejects(queued, { name: 'AbortError' });
+    cancelled.abort(); unlock(); await rejected;
+    assert.equal(f.service.commands.length, 0);
+    const request = f.service.request.bind(f.service); let started, authorized = true;
+    const admitted = new Promise(resolve => { started = resolve; }), gate = new Promise(resolve => { releaseCreate = resolve; });
+    f.service.request = async (id, method, ...args) => {
+      const result = await request(id, method, ...args);
+      if (method === 'create') { started(); await gate; }
+      return result;
+    };
+    const pending = f.service.invokeAutomation({ ...binding, authorize() { if (!authorized) throw new Error('Revoked'); } }, 'inspect', {});
+    const denied = assert.rejects(pending, /Revoked/); await admitted; authorized = false; releaseCreate(); await denied;
+    assert.equal(f.service.commands.some(call => call.method === 'navigate'), false);
+    assert.equal(f.service.physical.size, 0); assert.equal(f.service.attachments.size, 0);
+    assert.equal((await f.service.catalog('owner', binding.authorize)).sessions[0].runtime, 'absent');
+  } finally { releaseCreate?.(); await f.close(); }
+});
+
+test('service navigation accepts its own document replacement and retains control and cancellation fences', async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service); f.service.echoAutomation = true;
+    await f.service.invokeAutomation(binding, 'inspect', {});
+    const request = f.service.request.bind(f.service), page = [...f.service.pages.values()][0];
+    const document = page.document;
+    f.service.request = async (id, method, ...args) => {
+      if (method === 'automation' && args[0].method === 'navigate') {
+        assert.equal(args[2], document); assert(args[1]);
+        f.service.receive({ type: 'input-reset', page: id, document: randomUUID() });
+        return { accepted: true };
+      }
+      return request(id, method, ...args);
+    };
+    assert.deepEqual(await f.service.invokeAutomation(binding, 'navigate', { url: 'https://example.test/new' }), { accepted: true });
+    assert.notEqual(page.document, document); assert.equal(page.controller, null);
+    const before = f.service.commands.length;
+    await assert.rejects(f.service.invokeAutomation(binding, 'navigate', { url: 'file:///tmp/private' }), { code: 'INVALID_ARGUMENT', outcome: 'not-dispatched' });
+    assert.equal(f.service.commands.length, before);
+    f.service.ownerConnector = () => assert.fail('must retain the existing owner');
+    f.service.child = { automationCancellation: 1, automationNavigation: 0 };
+    await assert.rejects(f.service.invokeAutomation(binding, 'reload', {}), { code: 'BROWSER_OWNER_INCOMPATIBLE', outcome: 'not-dispatched' });
+    assert.equal(f.service.commands.length, before);
+    f.service.ownerConnector = null; f.service.child = undefined;
+    const viewer = await f.connect('owner'); await viewer.call('open', { lease: binding.lease, multiView: true, visible: true });
+    await viewer.call('control', { action: 'human' });
+    await assert.rejects(f.service.invokeAutomation(binding, 'reload', {}), { code: 'CONTROL_BUSY' });
+    await viewer.detach();
+    const controller = new AbortController(); controller.abort();
+    await assert.rejects(f.service.invokeAutomation(binding, 'stop', {}, { signal: controller.signal }), { name: 'AbortError' });
+  } finally { await f.close(); }
+});
+
+test('service automation needs no viewer and retains account, host, scope and control authority', async () => {
+  const f = await fixture();
+  f.service.echoAutomation = true;
+  try {
+    const viewer = await f.connect('owner'), lease = 'browser-' + randomUUID(), { scope } = await viewer.call('state');
+    const values = { pages: [{ id: 'page', ownerId: 'scope', hostId: 'host', entries: [], index: -1 }],
+      tabs: [{ id: 'tab', pageId: 'page', ownerId: 'scope' }], storage: { page: lease } };
+    for (const [key, value] of Object.entries(values))
+      await viewer.call('state', { scope, key, value: JSON.stringify(value), expectedKeyRevision: 0, mutationId: randomUUID() });
+    await viewer.call('open', { lease, multiView: true, metadataRequired: true });
+    const page = [...f.service.pages.values()][0], memory = f.service.physical.get(page.id).memory;
+    const binding = { ownerId: 'owner', lease, scopeId: 'scope', hostId: 'host', authorize() {} };
+    await viewer.detach(); assert.equal(f.service.viewers(page).size, 0);
+    const before = f.service.commands.length;
+    for (const change of [{ ownerId: 'foreign' }, { scopeId: 'foreign' }, { hostId: 'foreign' }])
+      await assert.rejects(f.service.invokeAutomation({ ...binding, ...change }, 'inspect', {}), { code: 'TAB_ACCESS_DENIED' });
+    assert.equal(f.service.commands.length, before);
+    const read = await f.service.invokeAutomation(binding, 'inspect', {});
+    assert.equal(read.memory, memory); assert.equal(read.control, undefined);
+    const write = await f.service.invokeAutomation(binding, 'fill', { ref: 'fixture', value: 'service' });
+    assert.equal(write.memory, memory); assert(write.control); assert.equal(write.document, page.document);
+    assert.equal(page.controller, null); assert.equal(f.service.viewers(page).size, 0);
+    assert.equal(f.service.commands.filter(command => command.method === 'create').length, 1);
+    assert.equal(f.service.commands.at(-1).input.token, null);
+    const human = await f.connect('owner'); await human.call('open', { lease, multiView: true, visible: true });
+    const grant = await human.call('control', { action: 'human' });
+    await assert.rejects(f.service.invokeAutomation(binding, 'click', { ref: 'fixture' }), { code: 'CONTROL_BUSY' });
+    assert.equal(page.controlToken, grant.token);
+    const readWhileHuman = await f.service.invokeAutomation(binding, 'inspect', {});
+    assert.equal(readWhileHuman.control, undefined); assert.equal(page.controlToken, grant.token);
+    await human.call('control', { action: 'release', token: grant.token });
+    const request = f.service.request.bind(f.service);
+    let started;
+    f.service.request = (id, method, input, control, document, { signal } = {}) => {
+      if (method !== 'automation') return request(id, method, input, control, document);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(Object.assign(new Error('Cancelled'), { code: 'CDP_ABORTED', outcome: 'unknown' })), { once: true });
+        started();
+      });
+    };
+    let admitted = new Promise(resolve => { started = resolve; });
+    const interrupted = f.service.invokeAutomation(binding, 'fill', { ref: 'fixture', value: 'pending' });
+    const interruptedRejected = assert.rejects(interrupted, { code: 'CDP_ABORTED', outcome: 'unknown' });
+    await admitted;
+    const takeover = await human.call('control', { action: 'human', takeover: true });
+    await interruptedRejected;
+    assert.equal(page.controlToken, takeover.token, 'old cleanup must not release the human takeover');
+    await human.call('control', { action: 'release', token: takeover.token });
+    let enabled = true;
+    const revocable = { ...binding, authorize() { if (!enabled) throw new Error('Revoked'); } };
+    admitted = new Promise(resolve => { started = resolve; });
+    const revoked = f.service.invokeAutomation(revocable, 'fill', { ref: 'fixture', value: 'pending' });
+    const revokedRejected = assert.rejects(revoked, { code: 'CDP_ABORTED', outcome: 'unknown' });
+    await admitted; enabled = false; await revokedRejected;
+    assert.equal(page.controller, null); await human.detach();
+    await assert.rejects(f.service.invokeAutomation({ ...binding, authorize() { throw new Error('Revoked'); } }, 'inspect', {}), /Revoked/);
+  } finally { await f.close(); }
+});
+
 test('metadata committed before first native creation still navigates once and later viewers preserve the page', async () => {
   const f = await fixture();
   try {
@@ -622,10 +870,10 @@ test('committed catalog survives failed create without phantom live occupancy or
     const starting = await a.call('catalog');
     assert.equal(starting.sessions[0].runtime, 'starting'); assert.equal(starting.sessions[0].link, null);
     await b.call('open', { lease: randomUUID() });
-    const before = JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8'));
+    const before = (await readBrowserState(f.directory));
     assert.equal(before.pages.find(p => p.ownerId === 'owner-a').runtime.kind, 'starting');
     finish(); assert.match((await failed).message, /initialization failed/);
-    const committed = JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8'));
+    const committed = (await readBrowserState(f.directory));
     assert.equal(committed.pages.find(p => p.ownerId === 'owner-a').runtime.kind, 'absent');
     assert.equal((await a.call('catalog')).capacity.accountUsed, 0);
     assert.equal((await b.call('catalog')).sessions.length, 1, 'account isolation');
@@ -679,7 +927,7 @@ test('failed file draft and rejected physical epoch never leak into a later comm
     await f.service.load();
     await assert.rejects(f.service.commit(draft => { draft.pages.push({ id: 'uncommitted' }); throw Error('Abort draft'); }), /Abort draft/);
     const c = await f.connect('owner'); await c.call('open', { lease: randomUUID() });
-    const saved = JSON.parse(await readFile(join(f.directory, 'remote-browser/tabs.json'), 'utf8'));
+    const saved = (await readBrowserState(f.directory));
     assert.equal(saved.pages.length, 1); assert.notEqual(saved.pages[0].id, 'uncommitted');
     const page = [...f.service.pages.values()][0], epoch = page.runtimeEpoch ?? 0;
     f.service.resetVisibility(page); await f.service.runtimeState(page, 'unknown');
@@ -700,5 +948,82 @@ test('complete metadata registers a dormant logical session in the same commit w
     assert.equal(catalog.sessions.length, 1); assert.equal(catalog.sessions[0].runtime, 'absent'); assert.equal(catalog.capacity.accountUsed, 0);
     assert.equal(catalog.sessions[0].link.pageId, 'page-a'); assert.equal(f.service.commands.length, 0);
     await c.detach();
+  } finally { await f.close(); }
+});
+
+for (const change of ['owner', 'epoch', 'missing']) test(`unknown-page recovery fences stale ${change} results`, async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service); f.service.echoAutomation = true;
+    const request = f.service.request.bind(f.service); let lost = true, replace = false;
+    f.service.request = async (id, method, ...args) => {
+      const result = await request(id, method, ...args);
+      if (method === 'create' && lost) { lost = false; throw Object.assign(Error('lost create ACK'), { code: 'BROWSER_UNAVAILABLE', outcome: 'unknown' }); }
+      if (method === 'snapshot' && replace) {
+        replace = false; const page = [...f.service.pages.values()][0];
+        if (change === 'epoch') f.service.resetVisibility(page);
+        else f.service.child = { kill() {} };
+        page.live = false;
+        if (change === 'missing') throw Error('Browser page closed');
+      }
+      return result;
+    };
+    await assert.rejects(f.service.invokeAutomation(binding, 'inspect', {}), { outcome: 'unknown' });
+    const before = f.service.commands.length; replace = true;
+    await assert.rejects(f.service.invokeAutomation(binding, 'inspect', {}), { code: 'BROWSER_UNAVAILABLE', outcome: 'unknown' });
+    const page = [...f.service.pages.values()][0];
+    assert.equal(page.live, false);
+    assert.equal((await f.service.catalog('owner', binding.authorize)).sessions[0].runtime, 'unknown');
+    assert.deepEqual(f.service.commands.slice(before).map(command => command.method), ['snapshot']);
+    assert.equal(f.service.attachments.size, 0);
+  } finally { await f.close(); }
+});
+
+for (const boundary of ['before-close', 'after-close']) test(`failed activation fences native cleanup ${boundary}`, async () => {
+  const f = await fixture();
+  try {
+    const binding = await dormantServiceTab(f.service), request = f.service.request.bind(f.service);
+    const runtimeState = f.service.runtimeState.bind(f.service); let replaced = false;
+    const replace = () => {
+      replaced = true; const page = [...f.service.pages.values()][0];
+      f.service.resetVisibility(page); page.live = false; f.service.child = { kill() {} };
+    };
+    f.service.request = async (id, method, ...args) => {
+      const result = await request(id, method, ...args);
+      if (method === 'create') throw Error('activation configuration failed');
+      if (method === 'close' && boundary === 'after-close') replace();
+      return result;
+    };
+    f.service.runtimeState = async (page, kind, ...args) => {
+      await runtimeState(page, kind, ...args);
+      if (kind === 'unknown' && boundary === 'before-close' && !replaced) replace();
+    };
+    await assert.rejects(f.service.invokeAutomation(binding, 'inspect', {}), /activation configuration failed/);
+    assert.equal(replaced, true);
+    assert.equal(f.service.commands.filter(command => command.method === 'close').length, boundary === 'before-close' ? 0 : 1);
+    assert.equal((await f.service.catalog('owner', binding.authorize)).sessions[0].runtime, 'unknown');
+    assert.equal(f.service.attachments.size, 0);
+  } finally { await f.close(); }
+});
+
+test('discard acknowledgement survives a foreign retirement selection after its commit', async () => {
+  const f = await fixture();
+  try {
+    const client = await f.connect('owner'), lease = 'browser-' + randomUUID(), key = JSON.stringify(['owner', lease]);
+    const commit = f.service.commit.bind(f.service); let replaced = false;
+    f.service.commit = async (reduce, selection) => {
+      const result = await commit(reduce, selection);
+      if (!replaced && selection?.keys?.includes(key)) {
+        replaced = true;
+        await f.service.store.transact(() => {}, { ownerId: 'unrelated-account' });
+      }
+      return result;
+    };
+    await client.call('discard', { lease });
+    assert.equal(replaced, true);
+    assert.equal(await f.service.store.hasRetirement(key), true);
+    assert.equal(f.service.pages.size, 0);
+    assert.equal(f.service.commands.length, 0);
+    await client.detach();
   } finally { await f.close(); }
 });

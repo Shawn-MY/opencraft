@@ -1,20 +1,31 @@
 import { browserMetadataValueLimit, browserMetadataWireLimit } from '@opencraft/browser-core/metadata-limits';
+import { mergeBrowserMetadata, retireBrowserMetadata } from '@opencraft/browser-core/metadata-merge';
 import { prepareBrowserRuntimeAccess } from './remote-browser-access.mjs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createHash, randomUUID } from 'node:crypto';
-import { access, mkdir, readFile } from 'node:fs/promises';
+import { access, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import nativeDiagnostics from './remote-browser/diagnostics.cjs';
 import displayFlow from './remote-browser/display.cjs';
 import mediaPolicy from '@opencraft/remote-interaction/policy';
-import { BrowserStateFile, acquireBrowserStateWriter, sessionError, sessionLink, linkedSessions, occupied } from './remote-browser-state-file.mjs';
+import { acquireBrowserStateWriter, sessionError, sessionLink, sessionLinkIndex, linkedSessions, occupied, conversationScopes } from './remote-browser-state-file.mjs';
+import { BrowserStateStore } from './remote-browser/state-store.mjs';
 import { startBrowserOwner } from './remote-browser-owner.mjs';
+import { invokeRemoteAutomation } from './remote-browser/automation-service.mjs';
+import { activateRemotePage, acquirePageActivation } from './remote-browser/page-lifecycle.mjs';
+import { createRemoteTab } from './remote-browser/tab-creation.mjs';
+import { retireRemotePage, commitRemoteRetirement } from './remote-browser/tab-retirement.mjs';
+import { closeRemoteTab } from './remote-browser/tab-close.mjs';
+import { referenceLookup, referenceFacts, validateReferences } from './remote-browser/retirement-selection.mjs';
+import { retirementFacts, retirementSnapshot } from './remote-browser/retirement-facts.mjs';
 
 const methods = new Set(['viewport', 'navigate', 'reload', 'stop', 'back', 'forward', 'visible', 'keyframe', 'capture', 'zoom', 'input', 'text', 'ime', 'copy', 'automation', 'close']);
 const quietMethods = new Set(['visible', 'keyframe', 'input', 'text']);
 const unavailable = message => Object.assign(new Error(message), { code: 'BROWSER_UNAVAILABLE', retryable: true });
+const interruptedRequest = (request, message) => Object.assign(unavailable(message),
+  request.method === 'automation' ? { retryable: false, outcome: 'unknown' } : {});
 // The worker's bootstrap document is an empty tab, not an external URL.
 const checkpointUrl = url => url === 'about:blank' || url === '' ? null : url;
 function removedStorageLeases(previous, next) {
@@ -44,8 +55,8 @@ export class RemoteBrowserService {
     this.spawnImpl = spawnImpl;
     this.ownerConnector = ownerConnector;
     this.pages = new Map(); this.requests = new Map(); this.sockets = new Set();
-    this.attachments = new Map();
-    this.states = new Map(); this.retiredLeases = new Set(); this.persistence = Promise.resolve();
+    this.attachments = new Map(); this.metadataPeers = new Map();
+    this.states = new Map(); this.persistence = Promise.resolve();
     this.mediaBuckets = mediaPolicy.bucketBounds(mediaBuckets);
     this.diagnosticCount = 0;
     this.diagnosticCounts = new Map();
@@ -53,68 +64,92 @@ export class RemoteBrowserService {
     this.server = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: browserMetadataWireLimit });
   }
   async load() {
+    if (this.closed) throw new Error('Browser service closed');
     this.loading ??= (async () => {
       await mkdir(this.dataDirectory, { recursive: true, mode: 0o700 });
+      if (this.closed) throw new Error('Browser service closed');
       this.releaseWriter = await acquireBrowserStateWriter(this.dataDirectory);
-      let saved;
-      try { saved = JSON.parse(await readFile(join(this.dataDirectory, 'tabs.json'), 'utf8')); }
-      catch (error) { if (error.code === 'ENOENT') saved = { schemaVersion: 1, pages: [], retired: [], states: [] }; else throw new Error('Browser state could not be read'); }
-      if (saved.schemaVersion !== 1 || !Array.isArray(saved.pages) || !Array.isArray(saved.states)) throw new Error('Unsupported browser state');
+      if (this.closed) throw new Error('Browser service closed');
+      this.store = new BrowserStateStore(this.dataDirectory, () => { if (this.loaded) this.close(); });
+      await this.store.open();
+      if (this.closed) throw new Error('Browser service closed');
+      await this.store.transact(draft => {
+        if (this.closed) throw new Error('Browser service closed');
+        for (const p of draft.pages) if (p.runtime?.kind !== 'absent') p.runtime = { ...p.runtime, kind: this.ownerConnector ? 'unknown' : 'absent' };
+      }, { resourcesOnly: true });
+      const saved = this.store.current;
       for (const p of saved.pages) {
-        if (typeof p.ownerId !== 'string' || typeof p.key !== 'string' || p.id !== createHash('sha256').update(p.key).digest('hex')
-          || JSON.parse(p.key)[0] !== p.ownerId) throw new Error('Invalid browser state');
-        p.lifecycle ??= p.closing ? 'closing' : 'open';
-        // A loaded recovery record says nothing about current native residency.
-        // Keep its reservation until the exclusive owner handshake reconciles it.
-        if (p.runtime?.kind !== 'absent') p.runtime = { ...p.runtime, kind: this.ownerConnector ? 'unknown' : 'absent' };
-        p.link ??= sessionLink(saved.states.find(([owner]) => owner === p.ownerId)?.[1], JSON.parse(p.key)[1]);
-        this.pages.set(p.key, { ...p, url: checkpointUrl(p.url), controller: null, live: false });
+        this.pages.set(p.key, { ...structuredClone(p), url: checkpointUrl(p.url), controller: null, live: false });
       }
-      if (saved.retired !== undefined && (!Array.isArray(saved.retired) || saved.retired.some(key => {
-        if (typeof key !== 'string') return true;
-        try { const pair = JSON.parse(key); return !Array.isArray(pair) || pair.length !== 2 || pair.some(v => typeof v !== 'string'); } catch { return true; }
-      }))) throw new Error('Invalid browser retirement state');
-      saved.retired ??= [];
-      this.retiredLeases = new Set(saved.retired);
       for (const [owner, state] of saved.states) this.states.set(owner, state);
-      this.store = new BrowserStateFile(this.dataDirectory, saved);
       this.loaded = true;
       for (const page of this.pages.values()) if (page.closing) this.retryRetirement(page, 0);
-    })();
-    const attempt = this.loading;
-    try { return await attempt; }
-    catch (error) {
-      // A predecessor may still be flushing during managed handover. Busy is
-      // transient; corrupt state stays failed closed and is never replaced.
-      if (error.code === 'BROWSER_UNAVAILABLE' && this.loading === attempt) this.loading = null;
+    })().catch(async error => {
+      // Cleanup belongs to this shared loading attempt, not each awaiting caller.
+      await this.store?.close().catch(() => {});
+      await this.releaseWriter?.(); this.releaseWriter = null;
+      if (error.code === 'BROWSER_UNAVAILABLE' && error.retryable === true) this.loading = null;
       throw error;
-    }
+    });
+    return this.loading;
   }
-  commit(reduce) {
+
+  storageOutcomes() {
+    const outcome = this.loaded && !this.closed && this.store?.outcome;
+    return outcome ? [{ name: 'remote-browser', status: outcome.status, appliedVersion: outcome.appliedVersion,
+      backupPath: outcome.backupPath, movedAside: outcome.movedAsidePaths.length > 0 }] : [];
+  }
+  commit(reduce, selection) {
     if (this.closed) return Promise.reject(new Error('Browser service closed'));
-    const operation = this.store.transact(reduce);
+    const operation = this.store.transact(reduce, selection);
     this.persistence = this.store.tail;
     return operation;
   }
-  persist() {
+  persist(keys) {
     // Checkpoints may update recovery configuration of committed sessions only.
     // In-flight native state is never inferred from the mutable viewer Map.
-    const checkpoints = [...this.pages.values()].map(({ key, url, viewport, zoom }) => ({ key, url, viewport, zoom }));
+    const pages = keys === undefined ? [...this.pages.values()] : [...new Set(keys)].map(key => this.pages.get(key)).filter(Boolean);
+    const checkpoints = pages.map(({ key, url, viewport, zoom }) => ({ key, url, viewport, zoom }));
     return this.commit(draft => {
+      const records = new Map(draft.pages.map(record => [record.key, record]));
       for (const value of checkpoints) {
-        const record = draft.pages.find(p => p.key === value.key);
+        const record = records.get(value.key);
         if (record && record.lifecycle !== 'closed') Object.assign(record, value);
       }
-    });
+    }, { resourcesOnly: true, resourceKeys: checkpoints.map(page => page.key) });
   }
   async catalog(ownerId, authorize) {
     await this.load(); await this.store.tail; authorize();
-    return { sessions: this.store.current.pages.filter(p => p.ownerId === ownerId && p.lifecycle !== 'closed').map(p => ({
+    return { sessions: this.store.account(ownerId).pages.filter(p => p.lifecycle !== 'closed').map(p => ({
       sessionId: p.id, lease: JSON.parse(p.key)[1], lifecycle: p.lifecycle,
       runtime: p.runtime?.kind ?? 'unknown', link: p.link ?? null, url: p.url,
       createdAt: p.createdAt ?? null,
-    })), capacity: { limit: 64, used: this.store.current.pages.filter(occupied).length, accountLimit: 16,
-      accountUsed: this.store.current.pages.filter(p => p.ownerId === ownerId && occupied(p)).length } };
+    })), capacity: { limit: 64, used: this.store.accounts.used, accountLimit: 16,
+      accountUsed: this.store.account(ownerId).pages.filter(occupied).length } };
+  }
+  acquirePageActivation(key) { return acquirePageActivation(this, key); }
+  activatePage(options) { return activateRemotePage(this, options); }
+  createTab(binding, input, options) { return createRemoteTab(this, binding, input, options); }
+  closeTab(binding, input, options) { return closeRemoteTab(this, binding, input, options); }
+  metadataChanged(ownerId) {
+    const state = this.store.account(ownerId).states[0]?.[1];
+    for (const [ws, peer] of this.metadataPeers) {
+      if (peer.ownerId !== ownerId || ws.readyState !== WebSocket.OPEN) continue;
+      try { peer.authorize(); ws.send(JSON.stringify({ type: 'metadata-changed', revision: state?.revision ?? 0 })); }
+      catch { ws.close(1008, 'Browser authorization expired'); }
+    }
+  }
+  async conversationTabs(ownerId, hostId, threadId, authorize) {
+    await this.load(); await this.store.tail; authorize();
+    if (this.closed) throw unavailable('Browser service closed');
+    const state = this.store.account(ownerId).states[0]?.[1];
+    const scopes = conversationScopes(state, hostId, threadId);
+    return linkedSessions(ownerId, state).flatMap(entry => {
+      const record = this.store.account(ownerId).pages.find(page => page.key === entry.key);
+      if (!record || record.lifecycle !== 'open' || entry.link.hostId !== hostId || !scopes.has(entry.link.scopeId)) return [];
+      return [{ tabId: entry.link.tabId, pageId: entry.link.pageId, lease: JSON.parse(entry.key)[1], scopeId: entry.link.scopeId,
+        url: record.url, runtime: record.runtime?.kind ?? 'unknown' }];
+    });
   }
   async reserve(ownerId, key, input, authorize) {
     return this.commit(draft => {
@@ -132,7 +167,7 @@ export class RemoteBrowserService {
         const used = draft.pages.filter(occupied);
         if (used.filter(p => p.ownerId === ownerId).length >= 16)
           throw sessionError('ACCOUNT_CAPACITY', 'Your active browser page limit (16) is reached; close a page in Browser resources');
-        if (used.length >= 64)
+        if (draft.capacityUsed >= 64)
           throw sessionError('RUNTIME_CAPACITY', 'Shared browser capacity (64) is full; use Browser resources to manage your pages', true);
       }
       if (!record) {
@@ -148,7 +183,7 @@ export class RemoteBrowserService {
       }
       record.version = (record.version ?? 0) + 1;
       return structuredClone(record);
-    });
+    }, { ownerId, keys: [key] });
   }
   async runtimeState(page, kind, epoch = page.runtimeEpoch ?? 0) {
     return this.commit(draft => {
@@ -158,28 +193,53 @@ export class RemoteBrowserService {
       if (record.lifecycle !== 'open' && kind === 'live') return;
       record.runtime = { ...record.runtime, kind };
       if (kind === 'live') { record.url = page.url; record.viewport = page.viewport; record.zoom = page.zoom; }
-    });
+    }, { ownerId: page.ownerId });
   }
-  checkpoint() {
-    if (this.checkpointTimer || this.closed) return;
+  checkpoint(key) {
+    if (this.closed) return;
+    (this.checkpointKeys ??= new Set()).add(key);
+    if (this.checkpointTimer) return;
     this.checkpointTimer = setTimeout(() => {
       this.checkpointTimer = null;
-      void this.persist().catch(() => {
+      const keys = [...this.checkpointKeys]; this.checkpointKeys.clear();
+      void this.persist(keys).catch(() => {
         for (const ws of this.sockets) if (ws.readyState === WebSocket.OPEN)
           ws.send(JSON.stringify({ type: 'error', message: 'Browser recovery state could not be saved' }));
       });
     }, 150);
     this.checkpointTimer.unref();
   }
-  async metadata(ownerId, input, authorize) {
+  async metadata(ownerId, input, authorize, cursor, references) {
     await this.load();
     if (input === undefined) {
       await this.store.tail; authorize();
-      const previous = this.store.current.states.find(([owner]) => owner === ownerId)?.[1] ?? { revision: 0, values: {} };
-      return { ...previous, scope: createHash('sha256').update(this.dataDirectory + '\0' + ownerId).digest('hex') };
+      const scope = createHash('sha256').update(this.dataDirectory + '\0' + ownerId).digest('hex');
+      const query = references === undefined ? undefined : validateReferences(references);
+      const selected = await this.store.readRetirements(ownerId, query); authorize();
+      if (this.closed) throw new Error('Browser service closed');
+      const previous = selected.state;
+      const retirements = query === undefined ? selected.facts : referenceLookup(selected.references);
+      let retirementUpdate;
+      if (query === undefined) {
+        const { facts: _, ...update } = retirementSnapshot({ retiredResources: selected.facts }, ownerId, scope, cursor);
+        retirementUpdate = update;
+      } else retirementUpdate = { retiredTabs: referenceFacts(selected.references), retiredTabsMode: 'replace', retirementProjection: 'references' };
+      const values = Object.fromEntries(Object.entries(previous.values).map(([key, value]) => [key,
+        ['pages', 'tabs', 'storage'].includes(key) ? retireBrowserMetadata(key, value, retirements) : value]));
+      return { ...previous, values, ...retirementUpdate, scope };
     }
     const retiring = [];
-    const result = await this.commit(draft => {
+    let changed = false;
+    const reconcile = () => {
+      const account = this.store.account(ownerId);
+      for (const [owner, state] of account.states) this.states.set(owner, state);
+      for (const record of account.pages) if (!this.pages.has(record.key))
+        this.pages.set(record.key, { ...structuredClone(record), controller: null, live: false });
+      for (const key of retiring) { const page = this.pages.get(key); if (page) { page.closing = true; this.retryRetirement(page, 0); } }
+      if (changed) this.metadataChanged(ownerId);
+    };
+    let result;
+    try { result = await this.commit(draft => {
       if (this.closed) throw new Error('Browser service closed');
       authorize();
       const previous = draft.states.find(([owner]) => owner === ownerId)?.[1] ?? { revision: 0, values: {} };
@@ -187,47 +247,71 @@ export class RemoteBrowserService {
       if (input.scope !== scope) throw sessionError('STATE_CONFLICT', 'Browser account changed; reload to synchronize');
       if (!['pages', 'tabs', 'storage', 'bindings'].includes(input.key) || typeof input.value !== 'string' || input.value.length > browserMetadataValueLimit(input.key)
         || !/^[a-zA-Z0-9-]{20,100}$/.test(input.mutationId ?? '')) throw new Error('Invalid browser metadata');
-      const fingerprint = createHash('sha256').update(JSON.stringify([input.key, input.value])).digest('hex');
+      const merging = Object.hasOwn(input, 'baseValue');
+      if (merging && (input.baseValue !== null && (typeof input.baseValue !== 'string' || input.baseValue.length > browserMetadataValueLimit(input.key))
+        || !Number.isSafeInteger(input.expectedKeyRevision) || input.expectedKeyRevision < 0 || input.expectedKeyRevision > (previous.keyRevisions?.[input.key] ?? 0))) throw sessionError('STATE_CONFLICT', 'Invalid browser metadata base');
+      const fingerprint = createHash('sha256').update(JSON.stringify(merging ? [input.key, input.value, input.baseValue] : [input.key, input.value])).digest('hex');
       const receipt = previous.receipts?.find(r => r.id === input.mutationId);
       if (receipt) {
         if (receipt.fingerprint !== fingerprint) throw sessionError('OPERATION_CONFLICT', 'Browser operation ID reused with different content');
-        return { revision: receipt.revision, keyRevision: receipt.keyRevision };
+        return merging ? { revision: previous.revision, keyRevision: previous.keyRevisions?.[input.key] ?? 0, value: previous.values[input.key] }
+          : { revision: receipt.revision, keyRevision: receipt.keyRevision };
       }
       if (input.mutationId === previous.lastMutation && !previous.receipts) return { revision: previous.revision };
-      if (input.expectedKeyRevision !== undefined ? input.expectedKeyRevision !== (previous.keyRevisions?.[input.key] ?? 0) : input.expectedRevision !== previous.revision) throw sessionError('STATE_CONFLICT', 'Browser state changed in another client; reload to synchronize');
+      if (!merging && (input.expectedKeyRevision !== undefined ? input.expectedKeyRevision !== (previous.keyRevisions?.[input.key] ?? 0) : input.expectedRevision !== previous.revision)) throw sessionError('STATE_CONFLICT', 'Browser state changed in another client; reload to synchronize');
+      // A missing receipt is ambiguous after compaction. Old merge bases must
+      // not reapply an already committed edit whose ACK was lost.
+      const receiptFloor = previous.receiptFloor ?? (previous.receipts?.length === 256 ? previous.receipts[0].revision - 1 : 0);
+      if (merging && receiptFloor > 0 && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < receiptFloor))
+        throw sessionError('STATE_CONFLICT', 'Browser metadata retry history expired; reload to synchronize');
+      const retirements = retirementFacts(draft, ownerId);
+      const value = retireBrowserMetadata(input.key, merging ? mergeBrowserMetadata(input.key,
+        retireBrowserMetadata(input.key, input.baseValue, retirements), retireBrowserMetadata(input.key, input.value, retirements),
+        retireBrowserMetadata(input.key, previous.values[input.key] ?? null, retirements)) : input.value, retirements);
+      if (typeof value !== 'string' || value.length > browserMetadataValueLimit(input.key)) throw sessionError('STATE_TOO_LARGE', 'Browser metadata is too large');
       const keyRevision = (previous.keyRevisions?.[input.key] ?? 0) + 1;
       const next = { revision: previous.revision + 1, keyRevisions: { ...previous.keyRevisions, [input.key]: keyRevision }, lastMutation: input.mutationId,
-        values: { ...previous.values, [input.key]: input.value },
+        values: { ...previous.values, [input.key]: value },
+        receiptFloor: Math.max(receiptFloor, (previous.receipts?.length ?? 0) >= 256 ? previous.receipts[0].revision : 0),
         receipts: [...(previous.receipts ?? []), { id: input.mutationId, fingerprint, revision: previous.revision + 1, keyRevision }].slice(-256) };
-      // Old receipts can never execute again: their original CAS revision is
-      // below the monotonically increasing revision even after compaction.
+      // Ordinary writes use CAS; merge writes additionally fence compacted retry history.
       draft.states = draft.states.filter(([owner]) => owner !== ownerId); draft.states.push([ownerId, next]);
-      for (const record of draft.pages.filter(p => p.ownerId === ownerId)) {
-        const link = sessionLink(next, JSON.parse(record.key)[1]);
+      const links = sessionLinkIndex(next), existingKeys = new Set(draft.pages.map(record => record.key));
+      for (const record of draft.pages) {
+        const link = links.get(JSON.parse(record.key)[1])?.link;
         if (link) record.link = link;
       }
       // Import complete legacy projections into the canonical directory in the
       // same commit as their final dependency. Listing does not reserve native.
-      for (const candidate of linkedSessions(ownerId, next)) {
-        if (draft.retired.includes(candidate.key) || draft.pages.some(p => p.key === candidate.key)) continue;
-        if (draft.pages.filter(p => p.ownerId === ownerId).length >= 256) throw sessionError('SESSION_CAPACITY', 'Your saved browser session limit (256) is reached');
+      for (const candidate of linkedSessions(ownerId, next, links)) {
+        if (draft.retired.includes(candidate.key) || existingKeys.has(candidate.key)) continue;
+        if (draft.pages.length >= 256) throw sessionError('SESSION_CAPACITY', 'Your saved browser session limit (256) is reached');
         draft.pages.push({ ...candidate, id: createHash('sha256').update(candidate.key).digest('hex'), ownerId,
           lifecycle: 'open', version: 1, createdAt: Date.now(), zoom: 100, runtime: { kind: 'absent', generation: 0 } });
+        existingKeys.add(candidate.key);
       }
       // Compatibility close intent for old clients. Only explicit removal of a
       // previously committed reference counts; missing/malformed maps do not.
-      for (const lease of input.key === 'storage' ? removedStorageLeases(previous.values.storage, input.value) : []) {
+      for (const lease of input.key === 'storage' ? removedStorageLeases(previous.values.storage, value) : []) {
         const key = JSON.stringify([ownerId, lease]);
-        if (!draft.retired.includes(key)) draft.retired.push(key);
         const record = draft.pages.find(p => p.key === key);
-        if (record) { record.lifecycle = 'closing'; record.closing = true; record.runtime = { ...record.runtime, kind: 'stopping' }; retiring.push(key); }
+        if (record) { commitRemoteRetirement(draft, this.pages.get(key) ?? record, { advanceRevision: false }); retiring.push(key); }
+        else if (!draft.retired.includes(key)) draft.retired.push(key);
       }
-      return { revision: next.revision, keyRevision };
-    });
-    this.states = new Map(this.store.current.states); this.retiredLeases = new Set(this.store.current.retired);
-    for (const record of this.store.current.pages) if (!this.pages.has(record.key))
-      this.pages.set(record.key, { ...record, controller: null, live: false });
-    for (const key of retiring) { const page = this.pages.get(key); if (page) { page.closing = true; this.retryRetirement(page, 0); } }
+      changed = true;
+      return { revision: next.revision, keyRevision, ...(merging ? { value } : {}) };
+    }, { ownerId, values: ['pages', 'tabs', 'storage'].includes(input?.key) ? [input.value, input.baseValue].filter(value => typeof value === 'string').map(value => ({ ownerId, key: input.key, value })) : [] }); }
+    catch (error) {
+      // A reported failure can follow metadata publication.
+      // A retained receipt proves this draft's mutation reached committed state.
+      const published = changed && this.store.account(ownerId).states[0]?.[1]
+        .receipts?.some(receipt => receipt.id === input.mutationId);
+      if (published) {
+        reconcile(); Object.assign(error, { retryable: false, outcome: 'unknown' });
+      }
+      throw error;
+    }
+    reconcile();
     return result;
   }
   viewers(page) { return page.viewers ??= new Map(); }
@@ -250,33 +334,42 @@ export class RemoteBrowserService {
     const viewer = this.viewers(page).get(ws), intent = viewer?.visibilityEpoch ?? 0;
     const humanCurrent = () => input?.action !== 'human'
       || viewer?.visible && (viewer.visibilityEpoch ?? 0) === intent;
+    return this.changeControl(page, ws, input, authorize,
+      () => this.viewers(page).get(ws) === viewer && !!viewer && ws.readyState === WebSocket.OPEN, humanCurrent);
+  }
+  changeControl(page, participant, input, authorize, current, humanCurrent = () => true) {
     return this.controlQueue(page, async () => {
       authorize();
-      if (page.closing || !this.viewers(page).has(ws) || ws.readyState !== WebSocket.OPEN) throw new Error('Browser viewer closed');
+      if (page.closing || !current()) throw new Error('Browser controller closed');
       if (!['human', 'agent', 'release'].includes(input?.action)) throw new Error('Invalid browser control request');
       if (!humanCurrent()) throw Object.assign(new Error('Browser interaction ended'), { code: 'CONTROL_LOST', retryable: true });
       const release = input.action === 'release';
-      if (release && (page.controller !== ws || input.token !== page.controlToken)) return this.controlState(page, ws);
-      if (!release && page.controller === ws && page.controlKind === input.action) return this.controlState(page, ws);
+      if (release && (page.controller !== participant || input.token !== page.controlToken)) return this.controlState(page, participant);
+      if (!release && page.controller === participant && page.controlKind === input.action) return this.controlState(page, participant);
       if (!release && page.controller && (input.action === 'agent' || input.takeover !== true))
         throw Object.assign(new Error('Browser is controlled elsewhere; release control before Agent writes'), { code: 'CONTROL_BUSY', retryable: true });
+      const previousToken = page.controlToken;
       page.controller = null; page.controlToken = null; page.controlKind = null;
+      for (const request of this.requests.values())
+        if (request.page === page.id && request.method === 'automation' && request.control && request.control === previousToken) request.cancel?.();
       const epoch = page.controlEpoch = (page.controlEpoch ?? 0) + 1;
       this.controlChanged(page);
       const token = release ? null : randomUUID();
       // Ordered with native input/automation: old queued commands are fenced at
       // dispatch, and pressed contacts/keys/composition retire before the grant.
-      await this.request(page.id, 'control', { token }); authorize();
-      if (page.closing || this.viewers(page).get(ws) !== viewer || ws.readyState !== WebSocket.OPEN || !humanCurrent()) {
-        await this.request(page.id, 'control', { token: null });
-        throw Object.assign(new Error('Browser interaction ended'), { code: 'CONTROL_LOST', retryable: true });
-      }
-      if (!release) { page.controller = ws; page.controlToken = token; page.controlKind = input.action; }
+      await this.request(page.id, 'control', { token });
+      try {
+        authorize();
+        if (page.closing || !current() || !humanCurrent())
+          throw Object.assign(new Error('Browser interaction ended'), { code: 'CONTROL_LOST', retryable: true });
+      } catch (error) { await this.request(page.id, 'control', { token: null }); throw error; }
+      if (!release) { page.controller = participant; page.controlToken = token; page.controlKind = input.action; }
       this.controlChanged(page);
       if (!release) void this.request(page.id, 'observe').catch(() => {});
-      return { ...this.controlState(page, ws), epoch };
+      return { ...this.controlState(page, participant), epoch };
     });
   }
+  invokeAutomation(binding, method, input, options) { return invokeRemoteAutomation(this, binding, method, input, options); }
   keyframe(page, bucket = 'fast') {
     const input = page.productionDemand ? { bucket } : undefined;
     void this.request(page.id, 'keyframe', input).catch(() => {});
@@ -378,47 +471,20 @@ export class RemoteBrowserService {
   }
   detach(page, ws) {
     this.display.detach(ws);
+    const viewer = this.viewers(page).get(ws);
     if (!this.viewers(page).delete(ws)) return;
+    viewer?.abort?.abort();
     this.displayPace(page);
     if (page.controller === ws) {
+      const token = page.controlToken;
       page.controller = null; page.controlToken = null; page.controlKind = null; page.controlEpoch = (page.controlEpoch ?? 0) + 1;
+      for (const request of this.requests.values()) if (request.page === page.id && request.method === 'automation' && request.control === token) request.cancel?.();
       if (!page.closing) void this.controlQueue(page, () => this.request(page.id, 'control', { token: null })).catch(() => {});
     }
     this.controlChanged(page);
     if (!page.closing) void this.visibility(page).catch(() => {});
   }
-  retire(page, replying) {
-    if (page.retirement) return page.retirement;
-    page.closing = true; this.resetVisibility(page);
-    clearTimeout(page.keyTimer); clearTimeout(page.slowKeyTimer); page.keyTimer = page.slowKeyTimer = null;
-    this.retiredLeases.add(page.key);
-    clearTimeout(page.retirementTimer); page.retirementTimer = null;
-    page.retirement = (async () => {
-      await this.commit(draft => {
-        if (!draft.retired.includes(page.key)) draft.retired.push(page.key);
-        const record = draft.pages.find(p => p.key === page.key);
-        if (record) { record.lifecycle = 'closing'; record.closing = true; record.runtime = { ...record.runtime, kind: 'stopping', closeOperationId: record.runtime?.closeOperationId ?? randomUUID() }; }
-      });
-      for (const ws of this.viewers(page).keys()) if (ws !== replying) ws.close(1000, 'Browser tab closed');
-      // A close is a tab-owner operation, not a viewer reply. Once accepted it
-      // must finish even if the viewer disconnects while native work awaits.
-      if (page.creating) await page.creating.catch(() => {});
-      await this.start();
-      // Even an unknown create must cross an acknowledged retirement barrier.
-      await this.request(page.id, 'close');
-      page.live = false;
-      if (this.pages.get(page.key) === page) this.pages.delete(page.key);
-      page.controller = null; this.viewers(page).clear();
-      await this.commit(draft => { draft.pages = draft.pages.filter(p => p.key !== page.key); });
-      // A stale runtime remains pinned while any Tab exists. Releasing an idle
-      // transport lets the next open safely upgrade an empty native owner.
-      if (this.ownerConnector && this.child?.runtimeCurrent === false && !this.pages.size
-        && !this.requests.size && !this.attachments.size) {
-        const child = this.child; this.child = null; this.starting = null; child.kill();
-      }
-    })().catch(error => { page.retirement = null; this.retryRetirement(page); throw error; });
-    return page.retirement;
-  }
+  retire(page, replying, options) { return retireRemotePage(this, page, replying, options); }
   retryRetirement(page, delay = 1000) {
     if (this.closed || page.retirementTimer) return;
     page.retirementTimer = setTimeout(() => {
@@ -435,9 +501,11 @@ export class RemoteBrowserService {
     if (this.closed) throw new Error('Browser service closed');
     if (this.starting) return this.starting;
     this.starting = (async () => {
-      await this.load();
-      if (!await this.available()) throw new Error('Bundled browser runtime unavailable');
-      await mkdir(this.dataDirectory, { recursive: true, mode: 0o700 });
+      const requireOpen = () => { if (this.closed) throw new Error('Browser service closed'); };
+      await this.load(); requireOpen();
+      const available = await this.available(); requireOpen();
+      if (!available) throw new Error('Bundled browser runtime unavailable');
+      await mkdir(this.dataDirectory, { recursive: true, mode: 0o700 }); requireOpen();
       if (this.ownerConnector) {
         let child;
         try { child = await this.ownerConnector({ directory: this.directory, dataDirectory: this.dataDirectory }); }
@@ -451,13 +519,13 @@ export class RemoteBrowserService {
         const retire = event => {
           if (this.child !== child) return;
           this.child = null; this.starting = null; this.diagnose(event);
-          for (const request of this.requests.values()) { clearTimeout(request.timer); request.reject(unavailable('Browser owner disconnected')); }
+          for (const request of this.requests.values()) { clearTimeout(request.timer); request.reject(Object.assign(unavailable('Browser owner disconnected'), { retryable: false, outcome: 'unknown' })); }
           this.requests.clear();
           for (const page of this.pages.values()) {
             this.resetVisibility(page); page.live = false; page.painted = false; page.controller = null; page.controlToken = null; page.controlKind = null; page.controlEpoch = (page.controlEpoch ?? 0) + 1;
             for (const ws of this.viewers(page).keys()) ws.close(1011, 'Browser owner disconnected; reconnecting');
           }
-          void this.commit(draft => { for (const record of draft.pages) if (occupied(record)) record.runtime = { ...record.runtime, kind: 'unknown' }; }).catch(() => {});
+          void this.commit(draft => { for (const record of draft.pages) if (occupied(record)) record.runtime = { ...record.runtime, kind: 'unknown' }; }, { resourcesOnly: true }).catch(() => {});
           child.kill();
         };
         child.on('error', () => retire('owner_transport_error')); child.on('exit', () => retire('owner_detached'));
@@ -467,22 +535,31 @@ export class RemoteBrowserService {
         });
         // Only durable logical pages may adopt a live native page. Unknown
         // native IDs are orphans, never a source of new authorization.
-        const inventory = new Map(child.inventory.map(config => [config.id, config]));
-        for (const page of this.pages.values()) {
-          const config = inventory.get(page.id); if (!config) continue;
-          inventory.delete(page.id); page.live = true; page.painted = false; page.document = config.document;
-          page.viewport = { width: config.width, height: config.height, deviceProfile: config.deviceProfile };
-          page.url = checkpointUrl(config.navigation?.url); page.controller = null; page.controlToken = null; page.controlKind = null;
-          if (Number.isInteger(config.zoom)) page.zoom = config.zoom;
-        }
-        for (const id of inventory.keys()) await this.request(id, 'close');
-        await this.commit(draft => {
-          for (const record of draft.pages) {
-            const page = this.pages.get(record.key);
-            record.runtime = { ...record.runtime, kind: page?.live ? 'live' : 'absent' };
+        try {
+          const inventory = new Map(child.inventory.map(config => [config.id, config]));
+          for (const page of this.pages.values()) {
+            const config = inventory.get(page.id); if (!config) continue;
+            inventory.delete(page.id); page.live = true; page.painted = false; page.document = config.document;
+            page.viewport = { width: config.width, height: config.height, deviceProfile: config.deviceProfile };
+            page.url = checkpointUrl(config.navigation?.url); page.controller = null; page.controlToken = null; page.controlKind = null;
+            if (Number.isInteger(config.zoom)) page.zoom = config.zoom;
           }
-        });
-        return;
+          const requireOwner = () => {
+            if (this.closed || this.child !== child) throw unavailable('Browser owner changed during recovery');
+          };
+          for (const id of inventory.keys()) {
+            requireOwner(); await this.request(id, 'close'); requireOwner();
+          }
+          await this.commit(draft => {
+            requireOwner();
+            for (const record of draft.pages) {
+              const page = this.pages.get(record.key);
+              record.runtime = { ...record.runtime, kind: page?.live ? 'live' : 'absent' };
+            }
+          }, { resourcesOnly: true });
+          requireOwner();
+          return;
+        } catch (error) { retire('owner_recovery_failed'); throw error; }
       }
       const env = { ...process.env, OPENCRAFT_BROWSER_DATA_DIR: this.dataDirectory };
       // A trusted runtime needs no inherited Node hooks or ambient desktop.
@@ -496,7 +573,7 @@ export class RemoteBrowserService {
       this.isolated = isolated;
       let child;
       if (isolated) {
-        await prepareBrowserRuntimeAccess(this.directory);
+        await prepareBrowserRuntimeAccess(this.directory); requireOpen();
         // Root gateways never run hostile pages as root or silently disable the
         // Chromium sandbox. systemd gives this child a private dynamic UID and
         // mounts only public runtime assets through the root-private release.
@@ -524,10 +601,10 @@ export class RemoteBrowserService {
         this.lastBrowserFailure = failure;
         if (!this.closed) this.diagnose(event);
         failStartup?.(unavailable('Browser process exited during startup'));
-        for (const request of this.requests.values()) { clearTimeout(request.timer); request.reject(unavailable('Browser process exited')); }
+        for (const request of this.requests.values()) { clearTimeout(request.timer); request.reject(interruptedRequest(request, 'Browser process exited')); }
         this.requests.clear();
         for (const p of this.pages.values()) { this.resetVisibility(p); p.live = false; p.painted = false; p.controller = null; p.controlToken = null; p.controlKind = null; p.controlEpoch = (p.controlEpoch ?? 0) + 1; for (const ws of this.viewers(p).keys()) ws.close(1011, 'Browser process exited; reconnecting'); }
-        void this.commit(draft => { for (const record of draft.pages) if (occupied(record)) record.runtime = { ...record.runtime, kind: 'unknown' }; }).catch(() => {});
+        void this.commit(draft => { for (const record of draft.pages) if (occupied(record)) record.runtime = { ...record.runtime, kind: 'unknown' }; }, { resourcesOnly: true }).catch(() => {});
         // Retire this transport only. EOF/disconnect asks a still-running owned
         // worker to quit; its late messages/errors cannot touch the replacement.
         child.stdin?.destroy();
@@ -556,25 +633,38 @@ export class RemoteBrowserService {
         diagnostics.finish();
         if (failure) failure.native = diagnostics.snapshot();
       });
-      await new Promise((resolve, reject) => {
-        let settled = false;
-        const finish = error => { if (settled) return; settled = true; clearTimeout(timer); child.off('message', ready); error ? reject(error) : resolve(); };
-        failStartup = finish;
-        const ready = message => { if (message.type === 'ready') finish(); };
-        const timer = setTimeout(() => { child.kill(); finish(unavailable('Browser startup timed out')); }, 15000);
-        child.on('message', ready); child.once('error', () => finish(unavailable('Browser process could not start')));
-        child.once('exit', () => finish(unavailable('Browser process exited during startup')));
-      });
+      try {
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const cancel = () => finish(new Error('Browser service closed'));
+          const finish = error => {
+            if (settled) return; settled = true; clearTimeout(timer); child.off('message', ready);
+            if (this.cancelStartup === cancel) this.cancelStartup = null;
+            error ? reject(error) : resolve();
+          };
+          failStartup = finish; this.cancelStartup = cancel;
+          const ready = message => { if (message.type === 'ready') finish(); };
+          const timer = setTimeout(() => { child.kill(); finish(unavailable('Browser startup timed out')); }, 15000);
+          child.on('message', ready); child.once('error', () => finish(unavailable('Browser process could not start')));
+          child.once('exit', () => finish(unavailable('Browser process exited during startup')));
+        });
+        const requireNative = () => {
+          requireOpen();
+          if (this.child !== child) throw unavailable('Browser process changed during startup');
+        };
+        requireNative();
+        if (!this.nativeReconciled) {
+          await this.commit(draft => {
+            requireNative();
+            for (const record of draft.pages) record.runtime = { ...record.runtime, kind: 'absent' };
+          }, { resourcesOnly: true });
+          requireNative(); this.nativeReconciled = true;
+        }
+      } catch (error) { retire('startup_failed'); throw error; }
     })();
     const attempt = this.starting;
-    try {
-      await attempt;
-      if (!this.ownerConnector && !this.nativeReconciled) {
-        await this.commit(draft => { for (const record of draft.pages) record.runtime = { ...record.runtime, kind: 'absent' }; });
-        this.nativeReconciled = true;
-      }
-      return;
-    } catch (error) { if (this.starting === attempt) this.starting = null; throw error; }
+    try { await attempt; }
+    catch (error) { if (this.starting === attempt) this.starting = null; throw error; }
   }
   receive(message) {
     if (message.type === 'result') {
@@ -590,15 +680,15 @@ export class RemoteBrowserService {
       clearTimeout(p.keyTimer); p.keyTimer = null;
       void this.runtimeState(p, 'absent').catch(() => {});
       for (const [id, request] of this.requests) if (request.page === p.id) {
-        this.requests.delete(id); clearTimeout(request.timer); request.reject(unavailable('Browser renderer exited; reconnecting'));
+        this.requests.delete(id); clearTimeout(request.timer); request.reject(interruptedRequest(request, 'Browser renderer exited; reconnecting'));
       }
       for (const ws of this.viewers(p).keys()) ws.close(1011, 'Browser renderer exited; reconnecting');
       return;
     }
     if (message.type === 'error' && message.message === 'Browser renderer exited; reload this tab') this.diagnose('renderer_exited');
-    if (p && !p.recovering && message.type === 'navigation' && !message.state.isLoading) { p.url = checkpointUrl(message.state.url); this.checkpoint(); }
+    if (p && !p.recovering && message.type === 'navigation' && !message.state.isLoading) { p.url = checkpointUrl(message.state.url); this.checkpoint(p.key); }
     if (p && message.type === 'navigation' && !message.state.isLoading) this.refreshDocumentFrame(p);
-    if (p && message.type === 'viewport') { p.viewport = { width: message.width, height: message.height, deviceProfile: message.deviceProfile }; this.checkpoint(); }
+    if (p && message.type === 'viewport') { p.viewport = { width: message.width, height: message.height, deviceProfile: message.deviceProfile }; this.checkpoint(p.key); }
     if (!p) return;
     if (message.type === 'input-reset' && typeof message.document === 'string') p.document = message.document;
     const privateEvent = ['ime-state', 'context-menu', 'new-window'].includes(message.type);
@@ -626,16 +716,28 @@ export class RemoteBrowserService {
       ...(Number.isInteger(detail?.closeCode) && detail.closeCode >= 1000 && detail.closeCode < 5000 ? { closeCode: detail.closeCode } : {}),
       pendingRequests: this.requests.size }));
   }
-  request(page, method, input, control, document) {
+  request(page, method, input, control, document, { signal } = {}) {
+    if (signal?.aborted) return Promise.reject(Object.assign(new Error('Browser operation cancelled'), { code: 'CDP_ABORTED', retryable: false, outcome: 'not-dispatched' }));
     if (!this.child || (this.isolated ? this.child.stdin.destroyed : !this.child.connected)) return Promise.reject(unavailable('Browser unavailable'));
-    const id = randomUUID();
+    const id = randomUUID(), native = this.child, isolated = this.isolated;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.requests.delete(id); this.diagnose('request_timeout', method); reject(unavailable(`Browser operation timed out (${method})`)); }, 20000);
-      timer.unref(); this.requests.set(id, { page, resolve, reject, timer });
-      const failed = error => { if (error) { clearTimeout(timer); this.requests.delete(id); reject(unavailable('Browser disconnected')); } };
+      const timeout = method === 'automation' ? Math.min(65000, Math.max(35000, Number(input?.input?.timeoutMs ?? 0) + 5000)) : 20000;
+      const send = (message, callback) => isolated ? native.stdin.write(JSON.stringify(message) + '\n', callback) : native.send(message, callback);
+      const finish = callback => value => { clearTimeout(timer); this.requests.delete(id); signal?.removeEventListener('abort', abort); callback(value); };
+      const stop = error => {
+        if (!this.requests.has(id)) return;
+        if (method === 'automation') {
+          try { send({ id: randomUUID(), page, method: 'cancelAutomation', input: { requestId: id } }, () => {}); } catch {}
+        }
+        finish(reject)(error);
+      };
+      const abort = () => stop(Object.assign(new Error('Browser operation cancelled; inspect before repeating an effect'), { code: 'CDP_ABORTED', retryable: false, outcome: 'unknown' }));
+      const timer = setTimeout(() => { this.diagnose('request_timeout', method); stop(Object.assign(unavailable(`Browser operation timed out (${method})`), { retryable: false, outcome: 'unknown' })); }, timeout);
+      timer.unref(); this.requests.set(id, { page, method, control, resolve: finish(resolve), reject: finish(reject), timer, cancel: abort });
+      signal?.addEventListener('abort', abort, { once: true });
+      const failed = error => { if (error && this.requests.has(id)) finish(reject)(Object.assign(unavailable('Browser disconnected'), { retryable: false, outcome: 'unknown' })); };
       try {
-        if (this.isolated) this.child.stdin.write(JSON.stringify({ id, page, method, input, control, document }) + '\n', failed);
-        else this.child.send({ id, page, method, input, control, document }, failed);
+        send({ id, page, method, input, control, document }, failed);
       } catch (error) { failed(error); }
     });
   }
@@ -644,7 +746,7 @@ export class RemoteBrowserService {
       this.sockets.add(ws); track(ws);
       let page = null, pending = 0, opening = false;
       const reply = (id, value, error) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'result', id, value,
-        ...(error ? { error: { code: error.code || 'BROWSER_ERROR', message: error.message, retryable: !!error.retryable } } : {}) })); };
+        ...(error ? { error: { code: error.code || 'BROWSER_ERROR', message: error.message, retryable: !!error.retryable, outcome: error.outcome } } : {}) })); };
       ws.on('error', () => ws.terminate());
       ws.on('message', async (bytes, binary) => {
         if (binary) { this.diagnose('invalid_request'); ws.close(1008, 'Invalid browser request'); return; }
@@ -657,20 +759,18 @@ export class RemoteBrowserService {
           if (typeof message.id !== 'string' || message.id.length > 100) throw new Error('Invalid request id');
           if (message.method === 'catalog') { reply(message.id, await this.catalog(ownerId, authorize)); return; }
           if (message.method === 'state') {
-            const value = await this.metadata(ownerId, message.input, authorize); authorize(); reply(message.id, value); return;
+            if (message.subscribe === true) this.metadataPeers.set(ws, { ownerId, authorize });
+            const value = await this.metadata(ownerId, message.input, authorize, message.retirementCursor, message.retirementReferences); authorize(); reply(message.id, value); return;
           }
           if (message.method === 'discard') {
             if (!/^[a-zA-Z0-9-]{20,128}$/.test(message.input?.lease ?? '')) throw new Error('Invalid browser lease');
             await this.load(); authorize();
             const key = JSON.stringify([ownerId, message.input.lease]);
-            await this.commit(draft => {
-              authorize(); if (!draft.retired.includes(key)) draft.retired.push(key);
-              const record = draft.pages.find(p => p.key === key);
-              if (record) { record.lifecycle = 'closing'; record.closing = true; }
-            });
-            this.retiredLeases.add(key);
             const target = this.pages.get(key);
-            if (target) await this.retire(target);
+            if (target) await this.retire(target, undefined, { admit: authorize });
+            else {
+              await this.commit(draft => { authorize(); if (!draft.retired.includes(key)) draft.retired.push(key); }, { ownerId, keys: [key] });
+            }
             reply(message.id); return;
           }
           if (message.method === 'open') {
@@ -680,16 +780,12 @@ export class RemoteBrowserService {
             const key = JSON.stringify([ownerId, message.input.lease]);
             // Complete an earlier bootstrap before handing its live page to a
             // replacement. Otherwise two create/config/cleanup paths can race.
-            const previous = this.attachments.get(key);
-            let unlock;
-            const attachment = new Promise(resolve => { unlock = resolve; });
-            this.attachments.set(key, attachment);
-            releaseAttachment = () => { unlock(); if (this.attachments.get(key) === attachment) this.attachments.delete(key); };
-            await previous;
+            releaseAttachment = await this.acquirePageActivation(key);
             authorize();
             if (this.closed || ws.readyState !== WebSocket.OPEN) return;
             await this.load(); authorize();
-            if (this.retiredLeases.has(key)) throw sessionError('SESSION_CLOSED', 'Browser tab is closed');
+            if (await this.store.hasRetirement(key)) throw sessionError('SESSION_CLOSED', 'Browser tab is closed');
+            authorize();
             const existing = this.pages.get(key);
             if (existing?.closing) throw new Error('Browser tab is closing');
             const modern = message.input.multiView === true;
@@ -698,90 +794,27 @@ export class RemoteBrowserService {
               for (const old of this.viewers(existing).keys()) { this.detach(existing, old); old.close(4009, 'Browser viewer transferred'); }
             }
             if (existing && this.viewers(existing).size >= 16) throw new Error('Browser viewer limit reached');
-            await this.start(); authorize();
-            if (this.retiredLeases.has(key)) throw sessionError('SESSION_CLOSED', 'Browser tab is closed');
-            if (ws.readyState !== WebSocket.OPEN) return;
-            const unknown = this.store.current.pages.find(p => p.key === key)?.runtime?.kind === 'unknown';
-            if (unknown && existing && !existing.live) {
-              try { const config = await this.request(existing.id, 'snapshot'); existing.live = true; existing.document = config.document; await this.runtimeState(existing, 'live'); }
-              catch (error) {
-                if (error.message !== 'Browser page closed') throw error;
-                await this.request(existing.id, 'close'); await this.runtimeState(existing, 'absent');
-              }
-            }
-            // Metadata can register a logical tab before it has ever owned a
-            // native page. Only generation zero may consume an initial URL;
-            // existing blank documents still belong to their native session.
-            const firstCreation = !existing || !existing.live && existing.runtime?.generation === 0;
-            const reserved = await this.reserve(ownerId, key, message.input, authorize);
-            page = existing ?? { ...reserved, controller: null, live: false };
-            page.runtime = reserved.runtime;
-            if (this.retiredLeases.has(key)) throw sessionError('SESSION_CLOSED', 'Browser tab is closed');
-            this.viewers(page).set(ws, { visible: !modern || message.input.visible === true, visibilityEpoch: 0, modern, documentInput: message.input.documentInput === true, inputAcknowledgements: message.input.inputAcknowledgements === true, authorize, ready: false }); this.pages.set(key, page);
-            let config;
-            const resumed = page.live, recoveryUrl = page.url, recoveryZoom = page.zoom;
-            page.recovering = !resumed && !!existing;
-            const epoch = page.runtimeEpoch ?? 0, native = this.child;
-            const currentNative = () => page && !page.closing && (page.runtimeEpoch ?? 0) === epoch && this.child === native;
-            const requireNative = () => { if (!currentNative()) throw unavailable('Browser runtime changed; reconnecting'); };
             try {
-              page.creating = resumed && modern ? this.request(page.id, 'snapshot')
-                : this.request(page.id, 'create', { ...((modern && existing ? page.viewport : message.input?.viewport) ?? page.viewport
-                  ?? { deviceProfile: message.input?.defaultDeviceProfile ?? 'desktop' }), productionDemand: true });
-              config = await page.creating; requireNative(); page.live = true;
-              page.productionDemand = config.productionDemand === 1 && config.mediaBuckets === 2;
-              if ((!resumed || !page.document) && typeof config.document === 'string') page.document = config.document;
-              if (page.closing) throw new Error('Browser tab closed');
-              if (!resumed && existing) {
-                if (recoveryZoom !== 100) { await this.request(page.id, 'zoom', { percent: recoveryZoom }); requireNative(); }
-                if (recoveryUrl) { await this.request(page.id, 'navigate', { url: recoveryUrl }); requireNative(); }
-                config = await this.request(page.id, 'snapshot'); requireNative();
-                // loadURL has accepted the recovery, but may not have committed
-                // its first document yet. Keep the saved remote target as the
-                // authority so a viewer's stale initial URL cannot replace it.
-                if (recoveryUrl && !checkpointUrl(config.navigation?.url)) {
-                  config.navigation = { ...config.navigation, url: recoveryUrl, isLoading: true };
-                }
-              }
-              if (firstCreation && modern && message.input.initialUrl && (!existing || !recoveryUrl)) {
-                await this.visibility(page); requireNative();
-                await this.request(page.id, 'navigate', { url: message.input.initialUrl }); requireNative();
-                config = await this.request(page.id, 'snapshot'); requireNative();
-                if (!checkpointUrl(config.navigation?.url)) config.navigation = { ...config.navigation, url: message.input.initialUrl, isLoading: true };
-              }
-              page.recovering = false; page.url = checkpointUrl(config.navigation?.url) ?? null;
-              page.viewport = { width: config.width, height: config.height, deviceProfile: config.deviceProfile };
-              await this.runtimeState(page, 'live', epoch); requireNative(); authorize();
-              if (page.closing) throw sessionError('SESSION_CLOSING', 'Browser tab is closing');
-              if (ws.readyState !== WebSocket.OPEN) { this.detach(page, ws); return; }
-              if (!modern) await this.control(page, ws, { action: 'human', takeover: true }, authorize);
-              this.controlChanged(page);
-              reply(message.id, { ...config, document: page.document ?? config.document, documentInput: typeof (page.document ?? config.document) === 'string', inputAcknowledgements: message.input.inputAcknowledgements === true, inputWindow: 12, resumed, restored: !!existing && !resumed, multiView: true, initialized: modern && firstCreation, control: this.controlState(page, ws) });
-              const attached = this.viewers(page).get(ws); if (attached) {
-                attached.ready = true; this.displayPace(page);
-                if (message.input.mediaFeedback === 1) this.display.attach(page, ws, attached, message.input.mediaStage === 'rendered' ? 'rendered' : 'received');
-                this.displayPace(page); if (attached.visible) this.keyframe(page);
-              }
-            } catch (error) {
-              page.recovering = false;
-              if (page.closing) { page = null; throw error; }
-              this.detach(page, ws);
-              if (resumed && currentNative()) {
-                page.live = false;
-                await this.runtimeState(page, error.message === 'Browser page closed' ? 'absent' : 'unknown', epoch);
-              }
-              if (!resumed && currentNative()) {
-                page.live = false; page.url = recoveryUrl;
-                await this.runtimeState(page, 'unknown');
-                // A native negative ACK is different from transport uncertainty.
-                // Never release a timeout reservation based on a timer alone.
-                if (error.code !== 'BROWSER_UNAVAILABLE') {
-                  try { await this.request(page.id, 'close'); await this.runtimeState(page, 'absent'); }
-                  catch { /* unresolved reservation survives restart */ }
-                }
-              }
-              page = null; throw error;
-            }
+              await this.activatePage({ ownerId, key, input: message.input, modern, authorize,
+                attach: target => {
+                  page = target;
+                  this.viewers(page).set(ws, { visible: !modern || message.input.visible === true, visibilityEpoch: 0, modern, documentInput: message.input.documentInput === true, inputAcknowledgements: message.input.inputAcknowledgements === true, authorize, abort: new AbortController(), ready: false });
+                },
+                detach: target => this.detach(target, ws),
+                finish: async (target, { config, resumed, restored, initialized }) => {
+                  if (target.closing) throw sessionError('SESSION_CLOSING', 'Browser tab is closing');
+                  if (ws.readyState !== WebSocket.OPEN) { this.detach(target, ws); return; }
+                  if (!modern) await this.control(target, ws, { action: 'human', takeover: true }, authorize);
+                  this.controlChanged(target);
+                  reply(message.id, { ...config, document: target.document ?? config.document, documentInput: typeof (target.document ?? config.document) === 'string', inputAcknowledgements: message.input.inputAcknowledgements === true, inputWindow: 12, resumed, restored, multiView: true, initialized, control: this.controlState(target, ws) });
+                  const attached = this.viewers(target).get(ws); if (attached) {
+                    attached.ready = true; this.displayPace(target);
+                    if (message.input.mediaFeedback === 1) this.display.attach(target, ws, attached, message.input.mediaStage === 'rendered' ? 'rendered' : 'received');
+                    this.displayPace(target); if (attached.visible) this.keyframe(target);
+                  }
+                },
+              });
+            } catch (error) { page = null; throw error; }
             opening = false; return;
           }
           if (!page || this.pages.get(page.key) !== page || !this.viewers(page).has(ws)) throw new Error('Browser page not opened');
@@ -794,7 +827,7 @@ export class RemoteBrowserService {
           if (message.method === 'control') { reply(message.id, await this.control(target, ws, message.input, authorize)); return; }
           if (!methods.has(message.method)) throw new Error('Unsupported browser command');
           if (message.method === 'close') {
-            await this.retire(target, ws); if (page === target) page = null;
+            await this.retire(target, ws, { admit: authorize }); if (page === target) page = null;
             authorize(); reply(message.id); ws.close(1000, 'Browser tab closed'); return;
           }
           if (target.closing) throw new Error('Browser tab is closing');
@@ -812,15 +845,16 @@ export class RemoteBrowserService {
           const control = viewer.modern ? message.control : target.controlToken;
           if (!readOnly && (target.controller !== ws || !control || control !== target.controlToken))
             throw Object.assign(new Error('Browser control changed; start a new interaction'), { code: 'CONTROL_LOST', retryable: true });
-          const documentBound = ['input', 'text', 'ime'].includes(message.method);
+          const documentBound = ['input', 'text', 'ime', 'automation'].includes(message.method);
           const document = documentBound ? viewer.documentInput ? message.document : target.document : undefined;
           if (documentBound && viewer.documentInput && (typeof document !== 'string' || document !== target.document))
             throw Object.assign(new Error('Browser document changed'), { code: 'DOCUMENT_CHANGED', retryable: true });
-          const value = await this.request(target.id, message.method, message.input, readOnly ? undefined : control, document);
+          const value = await this.request(target.id, message.method, message.input, readOnly ? undefined : control, document,
+            message.method === 'automation' ? { signal: viewer.abort?.signal } : undefined);
           authorize();
           if (page !== target || !this.viewers(target).has(ws) || this.pages.get(target.key) !== target || ws.readyState !== WebSocket.OPEN) return;
-          if (message.method === 'zoom') { target.zoom = Number(message.input.percent); await this.persist(); }
-          if (['navigate', 'viewport'].includes(message.method)) await this.persist();
+          if (message.method === 'zoom') { target.zoom = Number(message.input.percent); await this.persist([target.key]); }
+          if (['navigate', 'viewport'].includes(message.method)) await this.persist([target.key]);
           if (!quietMethods.has(message.method) || message.method === 'input' && viewer.inputAcknowledgements) reply(message.id, value);
         } catch (error) { opening = false;
           if (message?.id) reply(message.id, null, error); else ws.close(1008, 'Invalid browser request');
@@ -834,29 +868,35 @@ export class RemoteBrowserService {
       ws.on('close', code => {
         this.diagnose('viewer_disconnected', undefined, { closeCode: code });
         this.sockets.delete(ws);
+        this.metadataPeers.delete(ws);
         if (!page) return;
         this.detach(page, ws);
       });
     });
   }
   close() {
-    if (this.closed) return;
+    if (this.closed) return this.persistence;
     if (this.loaded) void this.persist().catch(() => {});
     this.closed = true;
     this.display.close();
+    this.cancelStartup?.();
     this.diagnose('gateway_shutdown');
     for (const ws of this.sockets) {
       ws.close(1012, 'Browser connection restarting');
       const timer = setTimeout(() => ws.terminate(), 2000); timer.unref();
       ws.once('close', () => clearTimeout(timer));
     }
-    clearTimeout(this.checkpointTimer);
-    const releasing = Promise.resolve(this.loading).catch(() => {}).then(() => this.store?.tail).then(() => this.releaseWriter?.());
+    clearTimeout(this.checkpointTimer); this.checkpointKeys?.clear();
+    const releasing = Promise.resolve(this.loading).catch(() => {}).then(() => this.store?.tail).then(() => this.store?.close()).finally(() => this.releaseWriter?.());
     this.persistence = releasing.catch(() => {});
     for (const page of this.pages.values()) { this.resetVisibility(page); clearTimeout(page.retirementTimer); clearTimeout(page.keyTimer); }
-    for (const request of this.requests.values()) { clearTimeout(request.timer); request.reject(new Error('Browser service closed')); }
+    for (const request of this.requests.values()) {
+      if (request.method === 'automation') request.cancel?.();
+      else { clearTimeout(request.timer); request.reject(new Error('Browser service closed')); }
+    }
     this.requests.clear();
     if (this.isolated) this.child?.stdin.end(); else this.child?.kill();
     this.server.close();
+    return this.persistence;
   }
 }
