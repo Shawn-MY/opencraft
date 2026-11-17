@@ -1,16 +1,254 @@
 #!/usr/bin/env node
-import { readdir, lstat, readlink, rm, mkdir, appendFile } from 'node:fs/promises';
-import { join, resolve, relative, basename } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-const execFileAsync = promisify(execFile);
-export const DAY = 86400000; export const RETENTION_DAYS = 7;
-const repo = resolve(import.meta.dirname, '../..');
-const roots = (process.env.OPENCRAFT_LOCAL_RUNTIME_ROOTS?.split(',').filter(Boolean).map(resolve)) ?? [join(repo,'.local'),join(repo,'.runtime')];
-const apply = process.argv.includes('--apply'); const arg = process.argv.find((x)=>x.startsWith('--now=')); const now = arg ? new Date(arg.slice(6)).getTime() : Date.now();
-export const dateStamped = (name) => /(?:^|[-_])20\d{6}$/.test(name);
-async function treeStats(path) { let newest=0, bytes=0, sensitive=null; async function visit(p) { const i=await lstat(p); newest=Math.max(newest,i.mtimeMs); if(i.isDirectory()) for(const e of await readdir(p,{withFileTypes:true})) await visit(join(p,e.name)); else { bytes+=i.size; const n=basename(p).toLowerCase(); if(/^(?:\.env(?:\..*)?|.*\.(?:pem|key)|.*(?:credential|token).*)$/.test(n)) sensitive ??={kind:'credential',path:p}; if(/\.(?:db|sqlite\d*|sqlite-wal|sqlite-shm)$/.test(n)||/-(?:wal|shm)$/.test(n)) sensitive ??={kind:'database',path:p}; } } await visit(path); return {newest,bytes,sensitive}; }
-export async function processReferences(path, procRoot='/proc') { let entries; try { entries=await readdir(procRoot,{withFileTypes:true}); } catch(e) { return {refs:[],unknown:true,reason:`proc:${e.code??'read-failed'}`}; } const refs=[]; let unknown=false; for(const e of entries) { if(!e.isDirectory()||!/^[0-9]+$/.test(e.name)) continue; const pid=e.name; for(const slot of ['cwd','root','exe','maps','fd']) { const base=join(procRoot,pid,slot); let links; try { links=slot==='fd'?await readdir(base):['']; } catch(err) { if(!['ENOENT','ESRCH'].includes(err.code)) unknown=true; continue; } if(slot==='maps') { try { const {stdout}=await execFileAsync('rg',['-F',path,base]); if(stdout) refs.push({pid:Number(pid),slot,target:path}); } catch(err) { if(err.code!==1&&!['ENOENT','ESRCH'].includes(err.code)) unknown=true; continue; } } else for(const link of links) { let target; try { target=await readlink(join(base,link)); } catch(err) { if(!['ENOENT','ESRCH'].includes(err.code)) unknown=true; continue; } if(target&&(target===path||target.startsWith(`${path}/`))) refs.push({pid:Number(pid),slot,target}); } } } return {refs,unknown,reason:unknown?'proc-read-unknown':undefined}; }
-export async function inspect(path, at=now) { const tree=await treeStats(path); const proc=await processReferences(path); return {path,mtime:new Date(tree.newest).toISOString(),ageDays:(at-tree.newest)/DAY,size:tree.bytes,sensitive:tree.sensitive,...proc}; }
-async function main() { const candidates=[]; for(const root of roots) for(const e of await readdir(root,{withFileTypes:true}).catch(()=>[])) if(e.isDirectory()&&dateStamped(e.name)) candidates.push(await inspect(join(root,e.name))); const eligible=candidates.filter(x=>x.ageDays>=RETENTION_DAYS&&!x.unknown&&!x.refs.length&&!x.sensitive); const bytes=eligible.reduce((s,x)=>s+x.size,0); for(const x of candidates) { const reason=x.unknown?`reason=${x.reason}`:x.refs.length?`refs=${x.refs.map(r=>`${r.pid}:${r.slot}`).join(',')}`:x.sensitive?`reason=${x.sensitive.kind}:${relative(repo,x.sensitive.path)}`:''; console.log(`${eligible.includes(x)?(apply?'removed':'would-remove'):'kept'}\t${Math.round(x.ageDays*10)/10}d\t${Math.round(x.size/1048576)}MiB\t${relative(repo,x.path)}${reason?`\t${reason}`:''}`); } console.log(`summary\tcandidates=${candidates.length}\teligible=${eligible.length}\treclaimable=${Math.round(bytes/1048576)}MiB\tmode=${apply?'apply':'dry-run'}`); if(apply&&eligible.length) { const log=join(repo,'.local/maintenance/local-runtime-retention.jsonl'); await mkdir(join(repo,'.local/maintenance'),{recursive:true}); for(const x of eligible) { await rm(x.path,{recursive:true,force:true}); await appendFile(log,`${JSON.stringify({at:new Date().toISOString(),path:relative(repo,x.path),bytes:x.size,retentionDays:7})}\n`); } } }
-if(import.meta.main) await main();
+import { appendFile, lstat, mkdir, readFile, readdir, readlink, rm } from "node:fs/promises";
+import { basename, join, relative, resolve } from "node:path";
+
+export const DAY = 86_400_000;
+export const RETENTION_DAYS = 7;
+
+const defaultRepoRoot = resolve(import.meta.dirname, "../..");
+const processSlots = ["cwd", "root", "exe", "maps", "fd"];
+
+export function dateStamped(name) {
+  return /(?:^|[-_])20\d{6}$/.test(name);
+}
+
+function sensitiveFileKind(name) {
+  const lowerName = name.toLowerCase();
+  if (/^(?:\.env(?:\..*)?|.*\.(?:pem|key)|.*(?:credential|token).*)$/.test(lowerName)) {
+    return "credential";
+  }
+  if (/\.(?:db|sqlite.*)$/.test(lowerName) || /-(?:wal|shm)$/.test(lowerName)) {
+    return "database";
+  }
+  return null;
+}
+
+async function treeStats(path) {
+  let newest = 0;
+  let bytes = 0;
+  let sensitive = null;
+
+  async function visit(entryPath) {
+    // lstat measures the link itself; neither scanning nor removal follows it.
+    const info = await lstat(entryPath);
+    newest = Math.max(newest, info.mtimeMs);
+    if (info.isDirectory()) {
+      for (const entry of await readdir(entryPath, { withFileTypes: true })) {
+        await visit(join(entryPath, entry.name));
+      }
+      return;
+    }
+
+    bytes += info.size;
+    const kind = sensitiveFileKind(basename(entryPath));
+    if (kind && !sensitive) {
+      sensitive = { kind, path: entryPath };
+    }
+  }
+
+  await visit(path);
+  return { newest, bytes, sensitive };
+}
+
+function referencesDirectory(target, path) {
+  return target === path || target.startsWith(`${path}/`);
+}
+
+async function processHasExited(error, processPath) {
+  if (error.code !== "ENOENT" && error.code !== "ESRCH") {
+    return false;
+  }
+  try {
+    await lstat(processPath);
+    return false;
+  } catch (processError) {
+    return processError.code === "ENOENT" || processError.code === "ESRCH";
+  }
+}
+
+async function slotReferences(path, processPath, slot) {
+  const slotPath = join(processPath, slot);
+  if (slot === "maps") {
+    const maps = await readFile(slotPath, "utf8");
+    return maps.includes(path) ? [path] : [];
+  }
+
+  const links = slot === "fd" ? await readdir(slotPath) : [""];
+  const targets = [];
+  for (const link of links) {
+    let target;
+    try {
+      target = await readlink(join(slotPath, link));
+    } catch (error) {
+      // Descriptors can close after enumeration, including readdir's own fd.
+      if (slot === "fd" && (error.code === "ENOENT" || error.code === "ESRCH")) {
+        continue;
+      }
+      throw error;
+    }
+    if (referencesDirectory(target, path)) {
+      targets.push(target);
+    }
+  }
+  return targets;
+}
+
+export async function processReferences(path, procRoot = "/proc") {
+  let entries;
+  try {
+    entries = await readdir(procRoot, { withFileTypes: true });
+  } catch (error) {
+    return {
+      refs: [],
+      unknown: true,
+      reason: `proc:${error.code ?? "read-failed"}`,
+    };
+  }
+
+  const refs = [];
+  let unknown = false;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) {
+      continue;
+    }
+    const processPath = join(procRoot, entry.name);
+    for (const slot of processSlots) {
+      try {
+        const targets = await slotReferences(path, processPath, slot);
+        for (const target of targets) {
+          refs.push({ pid: Number(entry.name), slot, target });
+        }
+      } catch (error) {
+        if (!(await processHasExited(error, processPath))) {
+          unknown = true;
+        }
+      }
+    }
+  }
+  return { refs, unknown, reason: unknown ? "proc-read-unknown" : undefined };
+}
+
+export async function inspect(path, at = Date.now(), procRoot = "/proc") {
+  const tree = await treeStats(path);
+  const proc = await processReferences(path, procRoot);
+  return {
+    path,
+    mtime: new Date(tree.newest).toISOString(),
+    ageDays: (at - tree.newest) / DAY,
+    size: tree.bytes,
+    sensitive: tree.sensitive,
+    ...proc,
+  };
+}
+
+function eligibleForRemoval(candidate) {
+  return (
+    candidate.ageDays >= RETENTION_DAYS &&
+    !candidate.unknown &&
+    candidate.refs.length === 0 &&
+    !candidate.sensitive
+  );
+}
+
+function retentionReasons(candidate, repoRoot) {
+  const reasons = [];
+  if (candidate.unknown) {
+    reasons.push(`reason=${candidate.reason}`);
+  }
+  if (candidate.refs.length) {
+    const refs = candidate.refs.map((ref) => `${ref.pid}:${ref.slot}`).join(",");
+    reasons.push(`refs=${refs}`);
+  }
+  if (candidate.sensitive) {
+    const { kind, path } = candidate.sensitive;
+    reasons.push(`reason=${kind}:${relative(repoRoot, path)}`);
+  }
+  return reasons;
+}
+
+function reportCandidate(candidate, status, repoRoot, report) {
+  report(
+    [
+      status,
+      `${Math.round(candidate.ageDays * 10) / 10}d`,
+      `${Math.round(candidate.size / 1_048_576)}MiB`,
+      relative(repoRoot, candidate.path),
+      ...retentionReasons(candidate, repoRoot),
+    ].join("\t"),
+  );
+}
+
+async function removeCandidate(candidate, repoRoot) {
+  const logDirectory = join(repoRoot, ".local/maintenance");
+  const logPath = join(logDirectory, "local-runtime-retention.jsonl");
+  await mkdir(logDirectory, { recursive: true });
+  await rm(candidate.path, { recursive: true, force: true });
+  await appendFile(
+    logPath,
+    `${JSON.stringify({
+      at: new Date().toISOString(),
+      path: relative(repoRoot, candidate.path),
+      bytes: candidate.size,
+      retentionDays: RETENTION_DAYS,
+    })}\n`,
+  );
+}
+
+export async function runRetention({
+  repoRoot = defaultRepoRoot,
+  roots = [join(repoRoot, ".local"), join(repoRoot, ".runtime")],
+  procRoot = "/proc",
+  now = Date.now(),
+  apply = false,
+  report = console.log,
+} = {}) {
+  const candidates = [];
+  for (const root of roots) {
+    const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory() && dateStamped(entry.name)) {
+        candidates.push(await inspect(join(root, entry.name), now, procRoot));
+      }
+    }
+  }
+
+  const eligible = candidates.filter(eligibleForRemoval);
+  const bytes = eligible.reduce((sum, candidate) => sum + candidate.size, 0);
+  for (const candidate of candidates) {
+    let status = "kept";
+    if (eligible.includes(candidate)) {
+      status = "would-remove";
+      if (apply) {
+        await removeCandidate(candidate, repoRoot);
+        status = "removed";
+      }
+    }
+    reportCandidate(candidate, status, repoRoot, report);
+  }
+  report(
+    [
+      "summary",
+      `candidates=${candidates.length}`,
+      `eligible=${eligible.length}`,
+      `reclaimable=${Math.round(bytes / 1_048_576)}MiB`,
+      `mode=${apply ? "apply" : "dry-run"}`,
+    ].join("\t"),
+  );
+  return { candidates, eligible, bytes };
+}
+
+async function main() {
+  const nowArgument = process.argv.find((arg) => arg.startsWith("--now="));
+  const roots = process.env.OPENCRAFT_LOCAL_RUNTIME_ROOTS?.split(",")
+    .filter(Boolean)
+    .map((root) => resolve(root));
+  await runRetention({
+    roots,
+    apply: process.argv.includes("--apply"),
+    now: nowArgument ? new Date(nowArgument.slice(6)).getTime() : Date.now(),
+  });
+}
+
+if (import.meta.main) {
+  await main();
+}
