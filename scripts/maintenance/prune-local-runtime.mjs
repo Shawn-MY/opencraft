@@ -3,7 +3,6 @@ import { appendFile, lstat, mkdir, readFile, readdir, readlink, rm } from "node:
 import { basename, join, relative, resolve } from "node:path";
 
 export const DAY = 86_400_000;
-export const RETENTION_DAYS = 7;
 
 const defaultRepoRoot = resolve(import.meta.dirname, "../..");
 const processSlots = ["cwd", "root", "exe", "maps", "fd"];
@@ -23,15 +22,37 @@ function sensitiveFileKind(name) {
   return null;
 }
 
+function protectedDirectory(path, repoRoot) {
+  const parts = relative(repoRoot, path).split('/');
+  return parts.some((part) => /^(?:team-credentials|credentials|private)$/u.test(part));
+}
+
+function isUnder(path, root) {
+  return path === root || path.startsWith(`${root}/`);
+}
+
+function protectedByRoot(path, root) {
+  return isUnder(path, root) || isUnder(root, path);
+}
+
+function isAuditDirectory(path, repoRoot) {
+  return path === join(repoRoot, '.local', 'maintenance');
+}
+
 async function treeStats(path) {
   let newest = 0;
   let bytes = 0;
   let sensitive = null;
+  let credential = null;
+  let protectedDescendant = false;
 
   async function visit(entryPath) {
     // lstat measures the link itself; neither scanning nor removal follows it.
     const info = await lstat(entryPath);
     newest = Math.max(newest, info.mtimeMs);
+    if (/^(?:team-credentials|credentials|private)$/u.test(basename(entryPath))) {
+      protectedDescendant = true;
+    }
     if (info.isDirectory()) {
       for (const entry of await readdir(entryPath, { withFileTypes: true })) {
         await visit(join(entryPath, entry.name));
@@ -44,10 +65,13 @@ async function treeStats(path) {
     if (kind && !sensitive) {
       sensitive = { kind, path: entryPath };
     }
+    if (kind === "credential" && !credential) {
+      credential = { kind, path: entryPath };
+    }
   }
 
   await visit(path);
-  return { newest, bytes, sensitive };
+  return { newest, bytes, sensitive, credential, protectedDescendant };
 }
 
 function referencesDirectory(target, path) {
@@ -127,20 +151,24 @@ export async function inspect(path, at = Date.now(), procRoot = "/proc") {
     ageDays: (at - tree.newest) / DAY,
     size: tree.bytes,
     sensitive: tree.sensitive,
+    credential: tree.credential,
+    protectedDescendant: tree.protectedDescendant,
     ...proc,
   };
 }
 
-function eligibleForRemoval(candidate) {
+function eligibleForRemoval(candidate, repoRoot, protectedRoots) {
   return (
-    candidate.ageDays >= RETENTION_DAYS &&
     !candidate.unknown &&
     candidate.refs.length === 0 &&
-    !candidate.sensitive
+    !candidate.credential &&
+    !protectedDirectory(candidate.path, repoRoot) &&
+    !candidate.protectedDescendant &&
+    !protectedRoots.some((root) => protectedByRoot(candidate.path, root))
   );
 }
 
-function retentionReasons(candidate, repoRoot) {
+function retentionReasons(candidate, repoRoot, protectedRoots = []) {
   const reasons = [];
   if (candidate.unknown) {
     reasons.push(`reason=${candidate.reason}`);
@@ -149,21 +177,32 @@ function retentionReasons(candidate, repoRoot) {
     const refs = candidate.refs.map((ref) => `${ref.pid}:${ref.slot}`).join(",");
     reasons.push(`refs=${refs}`);
   }
-  if (candidate.sensitive) {
+  if (candidate.credential) {
+    reasons.push(`reason=credential:${relative(repoRoot, candidate.credential.path)}`);
+  } else if (candidate.sensitive) {
     const { kind, path } = candidate.sensitive;
     reasons.push(`reason=${kind}:${relative(repoRoot, path)}`);
+  }
+  if (protectedDirectory(candidate.path, repoRoot)) {
+    reasons.push("reason=protected-directory");
+  }
+  if (candidate.protectedDescendant) {
+    reasons.push("reason=protected-descendant");
+  }
+  if (protectedRoots.some((root) => protectedByRoot(candidate.path, root))) {
+    reasons.push("reason=operator-protected");
   }
   return reasons;
 }
 
-function reportCandidate(candidate, status, repoRoot, report) {
+function reportCandidate(candidate, status, repoRoot, report, protectedRoots = []) {
   report(
     [
       status,
       `${Math.round(candidate.ageDays * 10) / 10}d`,
       `${Math.round(candidate.size / 1_048_576)}MiB`,
       relative(repoRoot, candidate.path),
-      ...retentionReasons(candidate, repoRoot),
+      ...retentionReasons(candidate, repoRoot, protectedRoots),
     ].join("\t"),
   );
 }
@@ -179,7 +218,7 @@ async function removeCandidate(candidate, repoRoot) {
       at: new Date().toISOString(),
       path: relative(repoRoot, candidate.path),
       bytes: candidate.size,
-      retentionDays: RETENTION_DAYS,
+      policy: "unreferenced",
     })}\n`,
   );
 }
@@ -190,19 +229,22 @@ export async function runRetention({
   procRoot = "/proc",
   now = Date.now(),
   apply = false,
+  protectedRoots = [],
   report = console.log,
 } = {}) {
   const candidates = [];
   for (const root of roots) {
     const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
-      if (entry.isDirectory() && dateStamped(entry.name)) {
-        candidates.push(await inspect(join(root, entry.name), now, procRoot));
+      if (entry.isDirectory()) {
+        const path = join(root, entry.name);
+        if (!isAuditDirectory(path, repoRoot)) candidates.push(await inspect(path, now, procRoot));
       }
     }
   }
 
-  const eligible = candidates.filter(eligibleForRemoval);
+  const resolvedProtectedRoots = protectedRoots.map((root) => resolve(root));
+  const eligible = candidates.filter((candidate) => eligibleForRemoval(candidate, repoRoot, resolvedProtectedRoots));
   const bytes = eligible.reduce((sum, candidate) => sum + candidate.size, 0);
   for (const candidate of candidates) {
     let status = "kept";
@@ -213,7 +255,7 @@ export async function runRetention({
         status = "removed";
       }
     }
-    reportCandidate(candidate, status, repoRoot, report);
+    reportCandidate(candidate, status, repoRoot, report, resolvedProtectedRoots);
   }
   report(
     [
@@ -232,8 +274,13 @@ async function main() {
   const roots = process.env.OPENCRAFT_LOCAL_RUNTIME_ROOTS?.split(",")
     .filter(Boolean)
     .map((root) => resolve(root));
+  const protectedRoots = process.env.OPENCRAFT_LOCAL_RUNTIME_PROTECTED_ROOTS?.split(",")
+    .filter(Boolean)
+    .map((root) => resolve(root));
   await runRetention({
     roots,
+    protectedRoots,
+    procRoot: process.env.OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT || "/proc",
     apply: process.argv.includes("--apply"),
     now: nowArgument ? new Date(nowArgument.slice(6)).getTime() : Date.now(),
   });

@@ -671,7 +671,8 @@ profile 和截图路径保留在本次 Task receipt；结束后恢复本次启�
 `web-browser` and packs `@opencraft-app/opencraft` with the static site, bundled
 Node runtime, a systemd template and installation instructions. The package has
 no install lifecycle scripts or runtime npm dependencies. It does not package or
-manage DSH/Codex. Build output defaults to ignored `.local/web-packages`. This
+manage DSH/Codex. Build output defaults to an OS temporary directory outside the
+checkout. This
 command never publishes; validate the tgz before publishing to the public npm
 registry. Run `npm run test:web-updates` for registry/package/worker update and
 rollback behavior, alongside `npm run test:web-release`.

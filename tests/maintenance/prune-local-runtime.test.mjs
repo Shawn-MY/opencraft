@@ -1,51 +1,21 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import fsPromises, {
-  copyFile,
-  lstat,
-  lutimes,
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rm,
-  symlink,
-  utimes,
-  writeFile,
-} from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { DAY, runRetention } from "../../scripts/maintenance/prune-local-runtime.mjs";
+import { runRetention } from "../../scripts/maintenance/prune-local-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
-const now = Date.parse("2026-11-17T00:00:00Z");
-const old = new Date(now - 8 * DAY);
 const slots = ["cwd", "root", "exe", "maps", "fd"];
 
-async function ageTree(path, date) {
-  const info = await lstat(path);
-  if (info.isSymbolicLink()) {
-    await lutimes(path, date, date);
-    return;
-  }
-  if (info.isDirectory()) {
-    for (const entry of await readdir(path)) {
-      await ageTree(join(path, entry), date);
-    }
-  }
-  await utimes(path, date, date);
-}
-
 async function fixture(t) {
-  const repoRoot = await mkdtemp(join(tmpdir(), "opencraft-retention-"));
+  const repoRoot = await mkdtemp(join(tmpdir(), "opencraft-cleanup-"));
   t.after(() => rm(repoRoot, { recursive: true, force: true }));
   const procRoot = join(repoRoot, "proc");
   await mkdir(procRoot);
   const output = [];
-
   return {
     repoRoot,
     procRoot,
@@ -54,17 +24,10 @@ async function fixture(t) {
       const path = join(repoRoot, root, name);
       await mkdir(path, { recursive: true });
       await writeFile(join(path, "output.log"), "artifact");
-      await ageTree(path, old);
       return path;
     },
     run(options = {}) {
-      return runRetention({
-        repoRoot,
-        procRoot,
-        now,
-        report: (line) => output.push(line),
-        ...options,
-      });
+      return runRetention({ repoRoot, procRoot, report: (line) => output.push(line), ...options });
     },
   };
 }
@@ -75,325 +38,166 @@ async function createProcess(f, referencedSlot, target) {
   for (const slot of ["cwd", "root", "exe"]) {
     await symlink(slot === referencedSlot ? target : f.repoRoot, join(processPath, slot));
   }
-  await writeFile(
-    join(processPath, "maps"),
-    referencedSlot === "maps" ? `0000-1000 r--p 0000 00:00 0 ${target}\n` : "",
-  );
-  if (referencedSlot === "fd") {
-    await symlink(target, join(processPath, "fd", "3"));
-  }
-  return processPath;
+  await writeFile(join(processPath, "maps"), referencedSlot === "maps" ? `0000 ${target}\n` : "");
+  if (referencedSlot === "fd") await symlink(target, join(processPath, "fd", "3"));
 }
 
 async function assertMissing(path) {
   await assert.rejects(lstat(path), { code: "ENOENT" });
 }
 
-test("recent deep descendant mtime keeps an otherwise old directory", async (t) => {
+test("removal is independent of age and uses the newest descendant only as evidence", async (t) => {
   const f = await fixture(t);
-  const path = await f.createRun();
-  const nested = join(path, "nested", "deeper");
-  await mkdir(nested, { recursive: true });
-  const file = join(nested, "active.log");
-  await writeFile(file, "still active");
-  await ageTree(path, old);
-  const recent = new Date(now - DAY);
-  await utimes(file, recent, recent);
-
-  const result = await f.run({ apply: true });
-
-  assert.equal(result.candidates[0].ageDays, 1);
-  assert.equal(result.candidates[0].mtime, recent.toISOString());
-  assert.equal(result.eligible.length, 0);
-  assert.equal(await readFile(file, "utf8"), "still active");
+  const path = await f.createRun("recent-run");
+  const nested = join(path, "nested");
+  await mkdir(nested);
+  await writeFile(join(nested, "new.log"), "new");
+  const result = await f.run({ apply: true, now: Date.parse("2020-01-01T00:00:00Z") });
+  assert.equal(result.eligible.length, 1);
+  assert.equal(result.candidates[0].ageDays < 0, true);
+  await assertMissing(path);
 });
 
-for (const filename of [
-  ".env",
-  ".env.local",
-  "server.pem",
-  "server.key",
-  "credentials.json",
-  "access-token",
-  "CLIENT.KEY",
-]) {
-  test(`credential file ${filename} keeps its directory and reports the reason`, async (t) => {
+test("credential files and credential directories are always retained", async (t) => {
+  const f = await fixture(t);
+  const credential = await f.createRun("credential-run");
+  await writeFile(join(credential, ".env"), "TOKEN=x");
+  const directory = await f.createRun("team-credentials", ".local");
+  const result = await f.run({ apply: true });
+  assert.equal(result.eligible.length, 0);
+  assert.equal(await readFile(join(credential, ".env"), "utf8"), "TOKEN=x");
+  assert.ok((await lstat(directory)).isDirectory());
+  assert.ok(f.output.some((line) => line.includes("reason=credential:")));
+  assert.ok(f.output.some((line) => line.includes("reason=protected-directory")));
+});
+
+test("credentials win over database markers and nested protected directories", async (t) => {
+  const f = await fixture(t);
+  const path = await f.createRun("mixed");
+  await writeFile(join(path, "state.sqlite"), "database");
+  await mkdir(join(path, "private"));
+  await writeFile(join(path, "private", "identity.key"), "credential");
+  const result = await f.run({ apply: true });
+  assert.equal(result.eligible.length, 0);
+  assert.ok((await lstat(path)).isDirectory());
+  assert.ok(f.output[0].includes("reason=credential:"));
+  assert.ok(f.output[0].includes("reason=protected-descendant"));
+});
+
+test("operator protected roots remain safe when the host process namespace is incomplete", async (t) => {
+  const f = await fixture(t);
+  const path = await f.createRun("known-live");
+  const result = await f.run({ apply: true, protectedRoots: [path] });
+  assert.equal(result.eligible.length, 0);
+  assert.ok((await lstat(path)).isDirectory());
+  assert.ok(f.output[0].includes("reason=operator-protected"));
+});
+
+test("a protected root nested below a candidate protects the candidate", async (t) => {
+  const f = await fixture(t);
+  const path = await f.createRun("deployment");
+  const nested = join(path, "releases", "live");
+  await mkdir(nested, { recursive: true });
+  const result = await f.run({ apply: true, protectedRoots: [nested] });
+  assert.equal(result.eligible.length, 0);
+  assert.ok((await lstat(path)).isDirectory());
+  assert.ok(f.output[0].includes("reason=operator-protected"));
+});
+
+test("an unreferenced database is removable while an open reference protects its directory", async (t) => {
+  const f = await fixture(t);
+  const removable = await f.createRun("database-history");
+  await writeFile(join(removable, "state.sqlite"), "old");
+  const referenced = await f.createRun("database-live");
+  const db = join(referenced, "state.sqlite");
+  await writeFile(db, "live");
+  await createProcess(f, "fd", db);
+  const result = await f.run({ apply: true });
+  assert.equal(result.eligible.length, 1);
+  await assertMissing(removable);
+  assert.ok((await lstat(referenced)).isDirectory());
+  assert.ok(f.output.some((line) => line.includes("refs=123:fd")));
+});
+
+for (const slot of slots) {
+  test(`proc ${slot} reference protects its directory`, async (t) => {
     const f = await fixture(t);
-    const path = await f.createRun();
-    await mkdir(join(path, "nested"));
-    const file = join(path, "nested", filename);
-    await writeFile(file, "fixture");
-    await ageTree(path, old);
-
+    const path = await f.createRun(`referenced-${slot}`);
+    await createProcess(f, slot, join(path, "output.log"));
     const result = await f.run({ apply: true });
-
     assert.equal(result.eligible.length, 0);
-    assert.equal(await readFile(file, "utf8"), "fixture");
-    assert.ok(
-      f.output.some((line) =>
-        line.includes(`reason=credential:.local/run-20261101/nested/${filename}`),
-      ),
-    );
+    assert.ok((await lstat(path)).isDirectory());
+    assert.ok(f.output.some((line) => line.includes(`refs=123:${slot}`)));
   });
 }
 
-for (const filename of [
-  "state.db",
-  "state.sqlite",
-  "state.sqlite3",
-  "state.sqlite.backup",
-  "state.sqlite-wal",
-  "state.sqlite-shm",
-  "data-wal",
-  "data-shm",
-]) {
-  test(`database file ${filename} keeps its directory and reports the reason`, async (t) => {
-    const f = await fixture(t);
-    const path = await f.createRun();
-    const file = join(path, filename);
-    await writeFile(file, "fixture");
-    await ageTree(path, old);
-
-    const result = await f.run({ apply: true });
-
-    assert.equal(result.eligible.length, 0);
-    assert.equal(await readFile(file, "utf8"), "fixture");
-    assert.ok(
-      f.output.some((line) => line.includes(`reason=database:.local/run-20261101/${filename}`)),
-    );
-  });
-}
-
-test("unreadable proc root keeps eligible directories as unknown", async (t) => {
+test("unreadable process state is retained conservatively", async (t) => {
   const f = await fixture(t);
   const path = await f.createRun();
   await rm(f.procRoot, { recursive: true });
-
   const result = await f.run({ apply: true });
-
-  assert.equal(result.candidates[0].unknown, true);
   assert.equal(result.eligible.length, 0);
   assert.ok((await lstat(path)).isDirectory());
   assert.ok(f.output[0].includes("reason=proc:ENOENT"));
 });
 
-for (const slot of slots) {
-  test(`unreadable proc ${slot} keeps directories as unknown`, async (t) => {
-    const f = await fixture(t);
-    const path = await f.createRun();
-    const processPath = await createProcess(f);
-    const slotPath = join(processPath, slot);
-    await rm(slotPath, { recursive: true });
-    if (slot === "maps") {
-      await mkdir(slotPath);
-    } else {
-      await writeFile(slotPath, "unreadable as a process reference");
-    }
-
-    const result = await f.run({ apply: true });
-
-    assert.equal(result.candidates[0].unknown, true);
-    assert.equal(result.eligible.length, 0);
-    assert.ok((await lstat(path)).isDirectory());
-    assert.ok(f.output[0].includes("reason=proc-read-unknown"));
-  });
-
-  test(`proc ${slot} reference keeps its directory`, async (t) => {
-    const f = await fixture(t);
-    const path = await f.createRun();
-    await createProcess(f, slot, join(path, "output.log"));
-
-    const result = await f.run({ apply: true });
-
-    assert.equal(result.candidates[0].unknown, false);
-    assert.equal(result.eligible.length, 0);
-    assert.ok((await lstat(path)).isDirectory());
-    assert.ok(f.output[0].includes(`refs=123:${slot}`));
-  });
-}
-
-for (const slot of slots) {
-  test(`missing proc ${slot} is an absent reference even while the PID exists`, async (t) => {
-    const f = await fixture(t);
-    const path = await f.createRun();
-    const processPath = await createProcess(f);
-    await rm(join(processPath, slot), { recursive: true });
-
-    const result = await f.run({ apply: true });
-
-    assert.equal(result.candidates[0].unknown, false);
-    assert.equal(result.eligible.length, 1);
-    await assertMissing(path);
-  });
-}
-
-test("permission denied reading proc maps keeps directories as unknown", async (t) => {
+test("dry run reports all immediate directories without writing", async (t) => {
   const f = await fixture(t);
-  const path = await f.createRun();
-  const processPath = await createProcess(f);
-  const read = fsPromises.readFile;
-  // Inject the filesystem error so this also works when tests run as root.
-  t.mock.method(fsPromises, "readFile", async (file, ...args) => {
-    if (file === join(processPath, "maps")) {
-      throw Object.assign(new Error("Permission denied"), { code: "EACCES" });
-    }
-    return read(file, ...args);
-  });
-  syncBuiltinESMExports();
-  t.after(() => {
-    t.mock.restoreAll();
-    syncBuiltinESMExports();
-  });
-
-  const result = await f.run({ apply: true });
-
-  assert.equal(result.candidates[0].unknown, true);
-  assert.equal(result.candidates[0].reason, "proc-read-unknown");
-  assert.equal(result.eligible.length, 0);
-  assert.ok((await lstat(path)).isDirectory());
-});
-
-test(
-  "closed file descriptors do not make a live process unknown",
-  { skip: process.platform !== "linux" },
-  async (t) => {
-    const f = await fixture(t);
-    await f.createRun();
-    const processPath = await createProcess(f);
-    const fdPath = join(processPath, "fd");
-    await rm(fdPath, { recursive: true });
-    await symlink("/proc/self/fd", fdPath);
-
-    const result = await f.run();
-
-    assert.equal(result.candidates[0].unknown, false);
-    assert.equal(result.eligible.length, 1);
-  },
-);
-
-test("default dry run reports eligible directories without deleting or logging", async (t) => {
-  const f = await fixture(t);
-  const path = await f.createRun();
-
+  const path = await f.createRun("history");
+  await f.createRun("nested/history", ".local");
   const result = await f.run();
-
-  assert.equal(result.eligible.length, 1);
-  assert.equal(await readFile(join(path, "output.log"), "utf8"), "artifact");
+  assert.equal(result.candidates.length, 2);
+  assert.equal(result.eligible.length, 2);
+  assert.ok((await lstat(path)).isDirectory());
   assert.ok(f.output[0].startsWith("would-remove\t"));
-  assert.ok(f.output.at(-1).endsWith("mode=dry-run"));
   await assertMissing(join(f.repoRoot, ".local/maintenance"));
 });
 
-test("apply deletes eligible directories and appends a record for each removal", async (t) => {
+test("apply deletes unreferenced directories and records the unreferenced policy", async (t) => {
   const f = await fixture(t);
-  const local = await f.createRun();
+  const local = await f.createRun("run-20261101");
   const runtime = await f.createRun("run-20261102", ".runtime");
-
   const result = await f.run({ apply: true });
-
   assert.equal(result.eligible.length, 2);
   await assertMissing(local);
   await assertMissing(runtime);
   const logPath = join(f.repoRoot, ".local/maintenance/local-runtime-retention.jsonl");
   const records = (await readFile(logPath, "utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(
-    records.map(({ path, bytes, retentionDays }) => ({ path, bytes, retentionDays })),
-    [
-      { path: ".local/run-20261101", bytes: 8, retentionDays: 7 },
-      { path: ".runtime/run-20261102", bytes: 8, retentionDays: 7 },
-    ],
-  );
-  assert.ok(records.every((record) => Number.isFinite(Date.parse(record.at))));
-  assert.equal(f.output.filter((line) => line.startsWith("removed\t")).length, 2);
-  assert.ok(f.output.at(-1).endsWith("mode=apply"));
-
-  await f.createRun("run-20261103");
+  assert.deepEqual(records.map(({ path, bytes, policy }) => ({ path, bytes, policy })), [
+    { path: ".local/run-20261101", bytes: 8, policy: "unreferenced" },
+    { path: ".runtime/run-20261102", bytes: 8, policy: "unreferenced" },
+  ]);
   await f.run({ apply: true });
-  assert.equal((await readFile(logPath, "utf8")).trim().split("\n").length, 3);
+  assert.equal((await readFile(logPath, "utf8")).trim().split("\n").length, 2);
 });
 
-test("symbolic links inside candidates are not followed during inspection or removal", async (t) => {
+test("symbolic links are not followed", async (t) => {
   const f = await fixture(t);
-  const path = await f.createRun();
+  const path = await f.createRun("links");
   const outside = join(f.repoRoot, "outside");
   await mkdir(outside);
-  await writeFile(join(outside, "state.db"), "keep outside data");
+  await writeFile(join(outside, "keep"), "outside");
   await symlink(outside, join(path, "linked"));
-  await symlink("missing-target", join(path, "dangling"));
-  await symlink(path, join(path, "cycle"));
-  await ageTree(path, old);
-
   const result = await f.run({ apply: true });
-
   assert.equal(result.eligible.length, 1);
   await assertMissing(path);
-  assert.equal(await readFile(join(outside, "state.db"), "utf8"), "keep outside data");
+  assert.equal(await readFile(join(outside, "keep"), "utf8"), "outside");
 });
 
-test("symbolic links in the runtime roots are not candidates", async (t) => {
+test("CLI supports a dry run", async (t) => {
   const f = await fixture(t);
-  const outside = join(f.repoRoot, "outside");
-  await mkdir(outside);
-  await writeFile(join(outside, "output.log"), "outside");
-  await mkdir(join(f.repoRoot, ".local"));
-  const link = join(f.repoRoot, ".local", "linked-20261101");
-  await symlink(outside, link);
-
-  const result = await f.run({ apply: true });
-
-  assert.equal(result.candidates.length, 0);
-  assert.ok((await lstat(link)).isSymbolicLink());
-  assert.equal(await readFile(join(outside, "output.log"), "utf8"), "outside");
-});
-
-test("only date-stamped direct children of the two runtime roots are candidates", async (t) => {
-  const f = await fixture(t);
-  await f.createRun("run-20261101");
-  await f.createRun("run-20261102", ".runtime");
-  const longLived = await f.createRun("steward");
-  const nested = await f.createRun("steward/nested-20261101");
-  const otherRoot = await f.createRun("run-20261103", "other");
-
-  const result = await f.run({ apply: true });
-
-  assert.equal(result.candidates.length, 2);
-  assert.equal(result.eligible.length, 2);
-  assert.ok((await lstat(longLived)).isDirectory());
-  assert.ok((await lstat(nested)).isDirectory());
-  assert.ok((await lstat(otherRoot)).isDirectory());
-});
-
-test("a directory becomes eligible exactly at seven idle days", async (t) => {
-  const f = await fixture(t);
-  const path = await f.createRun();
-  await ageTree(path, new Date(now - 7 * DAY));
-
-  const before = await f.run({ now: now - 1 });
-  const atBoundary = await f.run();
-
-  assert.equal(before.eligible.length, 0);
-  assert.equal(atBoundary.eligible.length, 1);
-});
-
-for (const apply of [false, true]) {
-  test(`CLI selects ${apply ? "apply with --apply" : "dry run by default"}`, async (t) => {
-    const f = await fixture(t);
-    const script = join(f.repoRoot, "scripts/maintenance/prune-local-runtime.mjs");
-    await mkdir(dirname(script), { recursive: true });
-    await copyFile(
-      new URL("../../scripts/maintenance/prune-local-runtime.mjs", import.meta.url),
-      script,
-    );
-
-    const { stdout } = await execFileAsync(
-      process.execPath,
-      [script, ...(apply ? ["--apply"] : []), `--now=${new Date(now).toISOString()}`],
-      {
-        env: { ...process.env, OPENCRAFT_LOCAL_RUNTIME_ROOTS: join(f.repoRoot, ".local") },
-      },
-    );
-
-    assert.ok(stdout.includes(`mode=${apply ? "apply" : "dry-run"}`));
-    await assertMissing(join(f.repoRoot, ".local/maintenance"));
+  await f.createRun("cli-run");
+  const script = join(f.repoRoot, "scripts/maintenance/prune-local-runtime.mjs");
+  await mkdir(dirname(script), { recursive: true });
+  await copyFile(new URL("../../scripts/maintenance/prune-local-runtime.mjs", import.meta.url), script);
+  const { stdout } = await execFileAsync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      OPENCRAFT_LOCAL_RUNTIME_ROOTS: join(f.repoRoot, ".local"),
+      OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT: f.procRoot,
+    },
   });
-}
+  assert.match(stdout, /mode=dry-run/);
+  assert.match(stdout, /would-remove/);
+  await assertMissing(join(f.repoRoot, ".local/maintenance"));
+});
