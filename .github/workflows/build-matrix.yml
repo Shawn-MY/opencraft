@@ -219,8 +219,16 @@ jobs:
           cache: npm
       - id: dependencies
         run: npm ci --no-audit --no-fund
+      # From here on every test file gets a private HOME/TMPDIR, and processes a
+      # test leaves running fail the run (tests/support/test-isolation.mjs). It is
+      # set after checkout because the actions themselves run on Node.
+      - name: Enable test isolation
+        run: echo "NODE_OPTIONS=--import $GITHUB_WORKSPACE/tests/support/test-isolation.mjs --test-global-setup=$GITHUB_WORKSPACE/tests/support/test-isolation-global.mjs" >> "$GITHUB_ENV"
       - name: Format files this pull request adds
         run: npm run check:format -- --base HEAD^1
+        if: always() && steps.dependencies.outcome == 'success' && github.event_name == 'pull_request'
+      - name: Lint files this pull request adds
+        run: npm run lint:changed -- --base HEAD^1
         if: always() && steps.dependencies.outcome == 'success' && github.event_name == 'pull_request'
       - name: Ensure setfacl for token ACL tests
         run: command -v setfacl >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends acl)
