@@ -69,13 +69,44 @@ test("native model suffix parsing handles long hostile names without backtrackin
   assert.equal(codexBaseModelId("one[]"), "one[]");
   assert.equal(codexBaseModelId("one" + "[".repeat(100000) + "]"), "one");
 });
+// A failed first close must remain observable by fixture cleanup. The engine
+// itself marks closed before every underlying operation has necessarily settled.
+function trackFixtureClose<T extends { close(): Promise<void> }>(owner: T): T {
+  const close = owner.close.bind(owner);
+  let completion: Promise<void> | undefined;
+  owner.close = () => completion ??= close();
+  return owner;
+}
+
+test("ACP fixture preserves the first close failure for cleanup", async () => {
+  let calls = 0;
+  const failure = new Error("synthetic close failure");
+  const owner = trackFixtureClose({ async close() { calls++; throw failure; } });
+  await assert.rejects(owner.close(), error => error === failure);
+  await assert.rejects(owner.close(), error => error === failure);
+  assert.equal(calls, 1);
+});
+
 async function fixture(t: test.TestContext, options: Record<string, any> = {}) {
   const root = await mkdtemp(join(tmpdir(), "acp-engine-test-")), trace = join(root, "trace.jsonl");
   const engineOptions = { command: process.execPath, args: [peer], cwd: root, dataDirectory: join(root, "data"), permission: "allow-once" as const, ...options, env: { ACP_TEST_TRACE: trace, ...options.env } };
-  const engine = new AcpEngine(engineOptions);
-  t.after(async () => { await engine.close(); await rm(root, { recursive: true, force: true }); });
+  const engines: AcpEngine[] = [];
+  const track = (next: AcpEngine) => { const owner = trackFixtureClose(next); engines.push(owner); return owner; };
+  const engine = track(new AcpEngine(engineOptions));
+  t.after(async () => {
+    // Close every owner before removing its shared data directory, including
+    // owners created later for restart/import coverage.
+    const errors: unknown[] = [];
+    for (const owner of engines.reverse()) {
+      try { await owner.close(); } catch (error) { errors.push(error); }
+    }
+    // A failed close may leave persistence or transport work running; preserve
+    // the directory rather than racing it or hiding the original failure.
+    if (errors.length) throw new AggregateError(errors, `ACP fixture close failed; preserved ${root}`);
+    await rm(root, { recursive: true, force: true });
+  });
   const calls = async () => { try { return (await readFile(trace, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } };
-  return { root, engine, calls, engineOptions };
+  return { root, engine, calls, engineOptions, track };
 }
 async function until(predicate: () => boolean) { const deadline = Date.now() + 4_000; while (!predicate()) { if (Date.now() >= deadline) throw new Error("ACP test condition timed out"); await delay(10); } }
 
@@ -100,7 +131,7 @@ test("ACP titles persist accepted input and native updates even after completion
   assert.equal((await f.engine.request("thread/read", { threadId: thread.id }, client)).thread.name, "我的自定义标题");
   assert.ok(!notices.some(notice => notice.params.threadName === "迟到的自动标题"));
   await f.engine.close();
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   assert.equal((await restored.request("thread/list", {}, client)).data[0].name, "我的自定义标题");
   assert.equal(restored.processId, null, "catalog reads never wake an agent");
   await restored.close();
@@ -109,7 +140,7 @@ test("ACP titles persist accepted input and native updates even after completion
 test("old ACP records recover a native catalog title on resume without resending input", async t => {
   const f = await fixture(t, { env: { ACP_TEST_TITLE_LIST: "Recovered native title" } });
   const { thread } = await f.engine.request("thread/start", {}, client); await f.engine.close();
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   const notices: any[] = []; restored.subscribe((method, params) => notices.push({ method, params }));
   await restored.request("thread/resume", { threadId: thread.id }, client);
   await until(() => notices.some(notice => notice.params.threadName === "Recovered native title"));
@@ -204,7 +235,7 @@ test("Cursor restores old parameterized IDs after restart and isolates conversat
   old.modelCatalog = [{ id: old.model, name: "One High" }];
   for (const key of ["modelConfigValues", "parameterConfigs", "reasoningModels", "reasoningConfig", "fastConfig", "fastModels"]) delete old[key];
   await writeFile(path, JSON.stringify(old));
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   const notices: any[] = []; restored.subscribe((method, params) => notices.push({ method, params }));
   const resumed = await restored.request("thread/resume", { threadId: first.thread.id }, client);
   assert.equal(resumed.model, "cursor:one"); assert.equal(resumed.reasoningEffort, "low"); assert.equal(resumed.serviceTier, "fast");
@@ -217,7 +248,7 @@ test("Cursor restores old parameterized IDs after restart and isolates conversat
   const read = await restored.request("thread/resume", { threadId: first.thread.id }, client);
   assert.equal(read.model, "cursor:one"); assert.equal(read.reasoningEffort, "low"); assert.equal(read.serviceTier, "fast");
   await restored.close();
-  const cold = new AcpEngine(f.engineOptions); t.after(() => cold.close());
+  const cold = f.track(new AcpEngine(f.engineOptions));
   const coldResume = await cold.request("thread/resume", { threadId: first.thread.id }, client);
   assert.equal(coldResume.reasoningEffort, "low"); assert.equal(coldResume.serviceTier, "fast");
   assert.equal((cold as any).sessions.get(first.thread.id).parameterConfigs.find((config: any) => config.id === "context").currentValue, "256k");
@@ -333,7 +364,7 @@ test("persisted flat ACP records recover per-model reasoning without a new nativ
   const legacy = JSON.parse(await readFile(path, "utf8"));
   delete legacy.reasoningModels;
   await writeFile(path, JSON.stringify(legacy));
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   const catalog = (await restored.request("model/list", {}, client)).data;
   for (const model of catalog) {
     assert.deepEqual(model.supportedReasoningEfforts.map((effort: any) => effort.reasoningEffort), ["low", "medium", "high", "xhigh", "max", "enabled"],
@@ -350,7 +381,7 @@ test("Codex resumes before applying cold model/reasoning/Fast selection and supp
   const legacy = JSON.parse(await readFile(path, "utf8"));
   for (const key of ["modelConfigValues", "legacyModelCatalog", "reasoningConfig", "fastConfig", "fastModels"]) delete legacy[key];
   await writeFile(path, JSON.stringify(legacy));
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   const notices: any[] = []; restored.subscribe((method, params) => notices.push({ method, params }));
   await restored.request("turn/start", { threadId: created.thread.id, model: "codex:one[low]", serviceTier: "fast", input: [{ type: "text", text: "resume" }] }, client);
   await until(() => notices.some(notice => notice.method === "turn/completed"));
@@ -663,7 +694,7 @@ test("native history import preserves identity, survives restart, and resumes on
   assert.equal((await f.engine.discoverNativeSessions()).sessions[0].imported, true);
   assert.ok(!(await f.calls()).some(call => ["session/new", "session/resume", "session/prompt"].includes(call.method)));
   await f.engine.close();
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   const importedPath = join(f.root, "data", `${thread.id}.json`);
   const oldImport = JSON.parse(await readFile(importedPath, "utf8"));
   delete oldImport.nativeProject; delete oldImport.nativeImport;
@@ -809,7 +840,7 @@ test("Codex explicit Full access reaches native mode before any input and surviv
   assert.deepEqual(applied.map(call => call.value), ["agent-full-access"]);
   assert.equal(created.activePermissionProfile.id, fullPermissions.permissions);
   await f.engine.close();
-  const restored = new AcpEngine(f.engineOptions); t.after(() => restored.close());
+  const restored = f.track(new AcpEngine(f.engineOptions));
   await restored.request("thread/resume", { threadId: created.thread.id }, client);
   const resumed = await f.calls();
   assert.equal(resumed.filter(call => call.configId === "mode").length, 2);
