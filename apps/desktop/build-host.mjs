@@ -1,13 +1,13 @@
-import { buildServerSpacesRuntime } from '../../scripts/package-server-spaces-runtime.mjs';
-import { buildTranscriptCacheRuntime } from '../../scripts/package-transcript-cache-runtime.mjs';
+import { buildServerSpacesRuntime } from '../../scripts/packaging/package-server-spaces-runtime.mjs';
+import { buildTranscriptCacheRuntime } from '../../scripts/packaging/package-transcript-cache-runtime.mjs';
 import { readFileSync, statSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
-import { buildTerminalOwnerRuntime } from '../../scripts/package-terminal-runtime.mjs';
-import { buildDshCapabilityPlugin } from '../../scripts/package-dsh-capability-runtime.mjs';
+import { buildTerminalOwnerRuntime } from '../../scripts/packaging/package-terminal-runtime.mjs';
+import { buildDshCapabilityPlugin } from '../../scripts/packaging/package-dsh-capability-runtime.mjs';
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const root = resolve(appRoot, "../..");
