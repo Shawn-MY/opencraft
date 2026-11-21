@@ -7,14 +7,15 @@ with the area that owns them; a task's working notes are not project entry point
 | Location | Contents |
 | --- | --- |
 | `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `AGENTS.md` | User, contributor, security and agent entry points |
-| `LICENSE`, `OWNERS`, `CHANGELOG.md` | Licensing, ownership and release history |
+| `LICENSE`, `CHANGELOG.md` | Licensing and release history |
 | `package.json`, `package-lock.json`, `tsconfig*.json`, `postcss.config.mjs`, root dotfiles | Workspace manifests, shared TypeScript settings and automatically discovered configuration |
 | `apps/`, `packages/`, `plugins/` | Platform applications, shared contracts and bundled integrations |
 | `docs/` | `architecture/` design and ownership topics grouped by domain (platform, execution, identity, chat-ui, workbench, extensions, server, browser, mobile), `develop/` contributor and build guides, `operations/` deployment and operations, `history/` migration records and retired designs; start at [the index](../README.md) |
 | `design.md`, `design/` | UI authoring entry, interaction specifications and topic-specific implementation records |
 | `config/` | Explicitly loaded tool configuration, versioned baselines and [repository metadata](../../config/catalog-info.yaml) |
 | `scripts/`, `tests/` | Development/build utilities, [tests grouped by domain](../../tests/README.md), [domain smoke checks](../../scripts/smoke/README.md) and browser fixtures |
-| `packaging/`, `runtime/`, `ops/` | Distribution templates, isolated execution-runtime inputs and service operations |
+| `deploy/` | Deployment assets: `docker/` images and Compose stacks, `web-server/` self-hosted package template and systemd units, `container-build/` scheduled image build, `nginx/` reverse proxy, `observability/` monitoring stack |
+| `runtime/`, `specs/` | Isolated execution-runtime inputs and formal (TLA+) models |
 | `examples/`, `vendor/` | Runnable extension examples and separately maintained integrations or dependencies |
 | `.github/`, `.agents/` | GitHub workflows and repository-local agent skills |
 | `.local/` (ignored) | Machine-specific logs, screenshots, profiles and temporary verification evidence |
