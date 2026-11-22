@@ -639,6 +639,8 @@ export async function startHeadlessServer(options = {}, composition = {}) {
     actorCollaboration = new Collaboration(serverStorage, actorStore,
       conversationExecution, Date.now, actorId => operator.owns(actorId) ? anonymousHandoff() : !instanceAccess || instanceAccess.admitsActor(actorId), orchestrationStorage,
       (context, ref) => threadAccess.allows(ref.serverId, ref.threadId, operator.owns(context.actorId) ? undefined : context));
+    // Inbox team commands go to the Server space ledger, the only writer of team membership.
+    actorCollaboration.attachSpaces({command:(context,command)=>serverSpaces.command(context,command)});
 
     threadOrchestration = new ThreadOrchestrationBroker(actorCollaboration, createThreadOrchestrationExecution(() => appHostServer, {
       enabled: ['codex', ...engines.filter(engine => engine !== 'dsh')], prepared: id => actorCollaboration.spawnPreparation(id),
@@ -1314,7 +1316,9 @@ export async function startHeadlessServer(options = {}, composition = {}) {
           return fetch(request);
         },
       }),
-      codexBinary:options.codexExecutable ?? join(root,'runtime/codex/bin/codex')});
+      codexBinary:options.codexExecutable ?? join(root,'runtime/codex/bin/codex'),
+      // Explicit local preview composition only (scripts/dev/preview-crew.ts); the CLI never sets it.
+      ...(composition.personalAssistantHost ?? {})});
     imPlugins = await startImPlugins(imConfiguration,{dataDirectory,capabilities,prepareCapabilities: tools => capabilityMcp.prepare(tools),actors:actorStore,collaboration:actorCollaboration,actorAccess,getAppHost:() => appHostServer,admittedActor:actorId => !instanceAccess || instanceAccess.admitsActor(actorId),...await createChannelSyncDependencies(composition,{collaboration:actorCollaboration})});
     try { availabilityNotification = await startAvailabilityNotification(process.env.OPENCRAFT_AVAILABILITY_NOTIFICATION_CONFIG, () => imPlugins); }
     catch { console.warn('[availability-notification] startup-unavailable'); }
