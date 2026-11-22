@@ -181,7 +181,7 @@ export function createConversationExecution(getAppHost, {serverId, hostId, engin
       return {conversations:rows.map(t=>({ref:{serverId,threadId:t.id},title:String(t.name || t.preview || t.id).slice(0,240),
         ...(suggestions ? {cwd:typeof t.cwd==='string'?t.cwd.slice(0,1024):null,updatedAt:t.updatedAt} : {})})),nextCursor:suggestions ? null : result.nextCursor ?? null};
     },
-    async create(target, content, operationKey, context) {
+    async create(target, content, operationKey, context, rememberThread) {
       if (target.serverId !== serverId || engine) throw fault(409, 'unsupported_capability');
       const assertCurrent = () => context.resourceOwner.assertCurrent();
       const scoped = (hostId, threadId, control, method, params, timeoutMs) =>
@@ -197,12 +197,13 @@ export function createConversationExecution(getAppHost, {serverId, hostId, engin
           ref = { serverId, threadId: thread.id };
       } catch (error) {
         if (error.status === 400) throw fault(400, 'creation_rejected');
-        if (error.status === 403) throw fault(403, 'conversation_action_denied');
+        if (error.status === 403) throw fault(403, 'creation_forbidden');
       }
       if (!ref) return { operationKey, ref: null, creationState: 'unknown', firstMessageState: 'unknown' };
+      await rememberThread?.(ref);
       let firstMessageState = 'unknown';
+      assertCurrent();
       try {
-        assertCurrent();
         const result = await scoped(hostId, ref.threadId, 'create-first-message', 'turn/start', {
           clientUserMessageId: 'input:' + randomUUID(), input: [{ type: 'text', text: content }],
         });
