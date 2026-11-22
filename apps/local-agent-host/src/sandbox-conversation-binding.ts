@@ -18,6 +18,8 @@ export async function createSandboxConversationBinding(options: {
   workspaceLease?: { workspaceId: string; generation: number };
   /** Trusted admission context, never copied from process request metadata. */
   processContext?: Pick<ProcessContext, "projectId" | "resourceOwnerId"> & { threadId?: string | null };
+  terminalSupported?: boolean;
+  probeTerminalAdmission?(): Promise<void>;
   authorize(): Promise<void>;
   onLost(): void;
   onCleanupUnconfirmed(): void;
@@ -41,7 +43,7 @@ export async function createSandboxConversationBinding(options: {
     python: "/usr/bin/python3", writable: true, authorize,
     onCleanupUnconfirmed: options.onCleanupUnconfirmed });
   const processContext = options.processContext ? { ...options.processContext } : undefined;
-  let processes = processContext?.threadId ? new SandboxProcessService({ ...options,
+  let processes = processContext?.threadId && options.terminalSupported !== false ? new SandboxProcessService({ ...options,
     context: { ...processContext, threadId: processContext.threadId }, authorize }) : undefined;
   let boundThreadId = processContext?.threadId ?? null;
   const bridge = await createSandboxJsonRpcBridge({ sandbox: options.sandbox,
@@ -94,7 +96,7 @@ export async function createSandboxConversationBinding(options: {
       if (typeof threadId !== "string" || !threadId || threadId.length > 512 || /[\x00-\x1f]/u.test(threadId))
         throw Error("Invalid sandbox thread identity");
       if (boundThreadId && boundThreadId !== threadId) throw Error("Sandbox thread binding conflict");
-      if (processContext && !processes) processes = new SandboxProcessService({ ...options,
+      if (processContext && !processes && options.terminalSupported !== false) processes = new SandboxProcessService({ ...options,
         context: { ...processContext, threadId }, authorize });
       boundThreadId = threadId;
     },
