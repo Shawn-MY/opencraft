@@ -20,6 +20,7 @@
     "src/environment-metadata-transport.ts",
     "src/capability-execution-context.ts",
     "src/git-status-capability.ts",
-    "src/execution-admission.worker.ts"
+    "src/execution-admission.worker.ts",
+    "src/account-model-defaults-http.ts"
   ]
 }
