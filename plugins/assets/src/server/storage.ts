@@ -6,7 +6,10 @@ import { WorkspaceBudgetStore, type WorkspaceBudgetRole, type WorkspaceBudgetOut
 import type { SandboxIdentity, SandboxResources } from "@opencraft/sandbox";
 import { parseGitExecutionLocator, type GitExecutionResolver } from "@opencraft/execution-environment/git-execution";
 import { EmployeeGitVaultStore, GitVaultError } from "@opencraft/execution-environment/employee-git-vault-store";
-import { EnvironmentLaunchOwner } from "@opencraft/execution-environment/environment-launch-owner";
+import {
+  EnvironmentLaunchOwner,
+  environmentTerminalRecords,
+} from "@opencraft/execution-environment/environment-launch-owner";
 import type { EnvironmentAccountResolver } from "@opencraft/execution-environment/environment-account";
 import { PersonalGitSealOwner } from "@opencraft/execution-environment/personal-git-seal";
 import type { GitGrantScope } from "@opencraft/execution-environment/personal-git-protocol";
@@ -16,7 +19,7 @@ import {
   type EnvironmentScopeRequest,
 } from "@opencraft/execution-environment/environment-metadata";
 import type {
-  EnvironmentLaunchContext,
+  AnyEnvironmentLaunchContext,
   EnvironmentLaunchTarget,
 } from "@opencraft/execution-environment/environment-delivery";
 import { PLATFORM_ASSET_SCOPE } from "../contract.js";
@@ -72,7 +75,10 @@ export async function createAssetsStorage(
         ? new EnvironmentLaunchOwner(
             vault,
             (input) => execution.resolve(input),
-            {},
+            // Terminal launches are admitted under the current Actor epoch.
+            execution.actor
+              ? { terminal: environmentTerminalRecords(vault, (account) => execution.actor!(account)) }
+              : {},
             options.environmentAccounts ? { accounts: options.environmentAccounts } : {},
           )
         : undefined;
@@ -185,7 +191,13 @@ export async function createAssetsStorage(
             // Metadata reads see committed bindings; a Gateway forwards a Thread
             // only after its binding committed, so later reads observe it.
             ...(environment
-              ? ["executionEnvironmentLaunch", "personalGitSeal", "environmentMetadataAdmit", "environmentMetadataProject"]
+              ? [
+                  "executionEnvironmentLaunch",
+                  "personalGitSeal",
+                  "environmentMetadataAdmit",
+                  "environmentMetadataProject",
+                  ...(execution.actor ? ["executionEnvironmentActor"] : []),
+                ]
               : []),
           ]
         : [],
@@ -196,6 +208,7 @@ export async function createAssetsStorage(
         gitHosts: providers.map((p) => p.host),
         gitAuthority: execution ? vault.personalGitAuthority("actor") : null,
         environmentIssuer: environment?.issuer ?? null,
+        environmentTerminal: !!environment && !!execution?.actor,
       },
       methods: {
         ...Object.fromEntries(
@@ -308,7 +321,7 @@ export async function createAssetsStorage(
         // method that returns decrypted ENV values to the caller of this Worker.
         ...(environment
           ? {
-              executionEnvironmentLaunch: (target: EnvironmentLaunchTarget, context: EnvironmentLaunchContext) => {
+              executionEnvironmentLaunch: (target: EnvironmentLaunchTarget, context: AnyEnvironmentLaunchContext) => {
                 try {
                   return environment!.seal(target, context);
                 } catch {
@@ -323,6 +336,18 @@ export async function createAssetsStorage(
                   throw new SandboxConfigurationError("execution_unavailable", 503);
                 }
               },
+              // The epoch a terminal reservation records; no value, no Project.
+              ...(execution?.actor
+                ? {
+                    executionEnvironmentActor: (account: string) => {
+                      try {
+                        return execution!.actor!(account);
+                      } catch {
+                        throw new SandboxConfigurationError("execution_unavailable", 503);
+                      }
+                    },
+                  }
+                : {}),
               environmentMetadataAdmit: (request: EnvironmentScopeRequest) => metadataCall((m) => m.admit(request)),
               environmentMetadataProject: (hostId: string, threadId: string) =>
                 metadataCall((m) => m.project(hostId, threadId)),

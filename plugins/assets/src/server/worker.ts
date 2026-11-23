@@ -8,9 +8,10 @@ import type {
 } from "@opencraft/execution-environment/git-execution";
 import type { GitConnectionsSnapshot } from "../git/contract.js";
 import type {
-  EnvironmentLaunchContext,
+  AnyEnvironmentLaunchContext,
   EnvironmentLaunchTarget,
 } from "@opencraft/execution-environment/environment-delivery";
+import type { EnvironmentActorEpoch } from "@opencraft/execution-environment/git-execution";
 import type {
   EnvironmentExecutionScope,
   EnvironmentMetadataPort,
@@ -50,7 +51,8 @@ export interface AssetStoragePort extends AssetConfigurationPort, WorkspaceBudge
   ): Promise<boolean>;
   executionGitReservation(locator: GitExecutionLocator): Promise<GitExecutionReservation | null>;
   executionGitGrant(locator: GitExecutionLocator): Promise<GitExecutionHandoff | null>;
-  executionEnvironmentLaunch(target: EnvironmentLaunchTarget, context: EnvironmentLaunchContext): Promise<string>;
+  executionEnvironmentLaunch(target: EnvironmentLaunchTarget, context: AnyEnvironmentLaunchContext): Promise<string>;
+  executionEnvironmentActor(account: string): Promise<EnvironmentActorEpoch | null>;
   personalGitSeal(scope: GitGrantScope): Promise<string>;
   environmentMetadataAdmit(request: EnvironmentScopeRequest): Promise<EnvironmentExecutionScope>;
   environmentMetadataProject(hostId: string, threadId: string): Promise<string | null>;
@@ -65,6 +67,8 @@ interface Ready {
   gitHosts: readonly string[];
   gitAuthority: string | null;
   environmentIssuer?: string | null;
+  /** The issuer also admits Hands terminal launches (Actor epoch reader). */
+  environmentTerminal?: boolean;
   workspaceExecution: boolean;
   botExecution?: boolean;
 }
@@ -136,8 +140,12 @@ export async function openAssetConfigurations(
       typeof ready.environmentIssuer === "string"
         ? Object.freeze({
             issuer: ready.environmentIssuer,
-            seal: (target: EnvironmentLaunchTarget, context: EnvironmentLaunchContext) =>
+            seal: (target: EnvironmentLaunchTarget, context: AnyEnvironmentLaunchContext) =>
               owner.call.executionEnvironmentLaunch(target, context),
+            // Terminal admission: the Actor epoch a reservation is written under.
+            ...(ready.environmentTerminal === true
+              ? { terminalActor: (account: string) => owner.call.executionEnvironmentActor(account) }
+              : {}),
           })
         : undefined,
     /** The same owner signs personal Git grants: only a grant scope goes in and
