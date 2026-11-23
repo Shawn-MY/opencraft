@@ -1,7 +1,7 @@
 import { lstat,readFile } from 'node:fs/promises';
 import { CodexProviderBridge } from './codex-provider-bridge.js';
 import type { BridgeGatewayOptions } from '@opencraft/agent-bridge-host/gateway';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DuplexTransport, TransportSubmissionContext } from '@opencraft/appserver-client/transport';
 import { LOGICAL_CLIENT_FIELD } from '@opencraft/app-host-protocol';
 import type { CapabilitySession } from '@opencraft/session-capabilities';
@@ -29,8 +29,31 @@ export interface BridgeExecutionAdmissionPort {
   started(threadId:string,inputId:string,turnId:string):void;
 }
 /** Keep signing and the bridge consumer adjacent; legacy traffic stays untouched. */
-export function createServerCodexBridge(legacy:DuplexTransport,options:BridgeGatewayOptions|undefined,admission:BridgeExecutionAdmissionPort):DuplexTransport {
-  return options?new BridgeExecutionAdmissionTransport(new CodexProviderBridge(legacy,options),admission):legacy;
+export { codexAdmissionPaused } from './codex-maintenance.js';
+export function createServerCodexBridge(legacy:DuplexTransport,options:BridgeGatewayOptions|undefined,admission:BridgeExecutionAdmissionPort,policy:ConstructorParameters<typeof CodexProviderBridge>[2]={}):DuplexTransport {
+  // A local Codex Host stages bridge attachments exactly as it does its own.
+  const host=legacy as Partial<{prepareExternalInput:NonNullable<typeof policy>['prepareInput'];projectExternalHistory:NonNullable<typeof policy>['projectHistory'];observeExternalTitle:NonNullable<typeof policy>['observeTitle']}>;
+  const attachments=typeof host.prepareExternalInput==='function'&&typeof host.projectExternalHistory==='function'&&typeof host.observeExternalTitle==='function'
+    ?{prepareInput:host.prepareExternalInput.bind(legacy),projectHistory:host.projectExternalHistory.bind(legacy),observeTitle:host.observeExternalTitle.bind(legacy),
+      ...(typeof (legacy as {projectExternalNotification?:unknown}).projectExternalNotification==='function'
+        ?{projectNotification:(legacy as unknown as {projectExternalNotification:(frame:Record<string,any>)=>Record<string,any>}).projectExternalNotification.bind(legacy)}:{}),
+      ...(typeof (legacy as {beginExternalUsage?:unknown}).beginExternalUsage==='function'?{usage:{
+        notification:(method:string,params:Record<string,unknown>)=>(legacy as any).observeExternalUsage(method,params),
+        begin:(...args:Parameters<NonNullable<NonNullable<typeof policy>['usage']>['begin']>)=>(legacy as any).beginExternalUsage(...args),
+        settle:(...args:Parameters<NonNullable<NonNullable<typeof policy>['usage']>['settle']>)=>(legacy as any).settleExternalUsage(...args),
+      }}:{}),
+      // The Host opens its sender storage when it connects, after this bridge is assembled.
+      senderAttribution:()=>(legacy as {externalSenderAttribution?:boolean}).externalSenderAttribution===true,
+      ...(typeof (legacy as {guardExternalQueue?:unknown}).guardExternalQueue==='function'?{queueGuard:(legacy as unknown as {guardExternalQueue:NonNullable<NonNullable<typeof policy>['queueGuard']>}).guardExternalQueue.bind(legacy)}:{}),
+      ...(typeof (legacy as {releaseForAdoption?:unknown}).releaseForAdoption==='function'?{releaseForAdoption:(legacy as unknown as {releaseForAdoption:(id:string)=>Promise<boolean>}).releaseForAdoption.bind(legacy)}:{})}:{};
+  // When the bridge owns every new Thread, its implicit identity is assigned here, before
+  // admission, so an implicit creation is prepared exactly as an explicit one.
+  const ownsNewThreads=!!(policy.newThreads||policy.exclusive||policy.adoptExisting);
+  if(!options)return legacy;
+  const bridge=new CodexProviderBridge(legacy,options,{...attachments,...policy});
+  // Host duties forwarded to the local Host (desktop) read a bridge Thread by its native session.
+  (legacy as {bindExternalThreadIdentities?:(identities:ReturnType<CodexProviderBridge['threadIdentities']>)=>void}).bindExternalThreadIdentities?.(bridge.threadIdentities());
+  return new BridgeExecutionAdmissionTransport(bridge,admission,ownsNewThreads);
 }
 
 /** Server-side admission only for opt-in bridge Threads. Legacy frames pass intact. */
@@ -41,7 +64,9 @@ export class BridgeExecutionAdmissionTransport implements DuplexTransport {
   private readonly preparingCreations=new Set<string>();
   private readonly creations=new Map<string,PreparedBridgeMcp>();
   private readonly requests=new Map<string,{threadId:string;inputId:string}>();
-  constructor(private readonly inner:DuplexTransport,private readonly port:BridgeExecutionAdmissionPort) {
+  /** The wrapped bridge's Thread identities, for Host services. */
+  threadIdentities(){return (this.inner as Partial<CodexProviderBridge>).threadIdentities?.();}
+  constructor(private readonly inner:DuplexTransport,private readonly port:BridgeExecutionAdmissionPort,private readonly ownsNewThreads=false) {
     inner.subscribeMessage(raw=>{
       const frame=JSON.parse(raw),p=frame.params??{};
       const creationKey=JSON.stringify([frame[LOGICAL_CLIENT_FIELD]??null,frame.id]);
@@ -73,7 +98,12 @@ export class BridgeExecutionAdmissionTransport implements DuplexTransport {
   send(raw:string,signal?:AbortSignal){return this.sendWithContext(raw,{sender:null},signal);}
   async sendWithContext(raw:string,context:TransportSubmissionContext,signal?:AbortSignal){
     if(this.closed)throw Error('Bridge admission owner is closed');
-    const frame=JSON.parse(raw),p=frame.params??{};
+    const frame=JSON.parse(raw);
+    if(this.ownsNewThreads&&frame.method==='thread/start'&&frame.id!==undefined&&frame.params?.agentBridge===undefined) {
+      frame.params={...frame.params,agentBridge:{threadId:randomUUID(),clientRequestId:`implicit:${randomUUID()}`}};
+      raw=JSON.stringify(frame);
+    }
+    const p=frame.params??{};
     if(frame.method==='thread/start'&&p.agentBridge&&this.port.prepareSessionMcp) {
       const seed=p.agentBridge.threadId;
       if(typeof seed==='string'&&seed) {
@@ -101,7 +131,11 @@ export class BridgeExecutionAdmissionTransport implements DuplexTransport {
         } finally {if(preparing)this.preparingCreations.delete(creationKey);}
       }
     }
-    if(frame.method==='turn/start'&&typeof p.threadId==='string'&&p.threadId.startsWith('bridge:codex:')) {
+    // Bridge Threads, including an existing local Thread the bridge adopts for this turn,
+    // are admitted here; one that stays local is admitted by its own Host.
+    const bridged=frame.method==='turn/start'&&typeof p.threadId==='string'&&(p.threadId.startsWith('bridge:codex:')
+      ||await (this.inner as {prepareRoute?:(method:string,threadId:string)=>Promise<boolean>}).prepareRoute?.('turn/start',p.threadId)===true);
+    if(bridged) {
       try {
         signal?.throwIfAborted();
         if(typeof p.clientUserMessageId!=='string'||!p.clientUserMessageId)throw Error('Stable execution input required');

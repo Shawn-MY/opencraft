@@ -7,12 +7,15 @@ import { build } from 'esbuild';
 import { daemonMainBundle } from './main-bundle.mjs';
 import { buildTerminalOwnerRuntime } from '../../scripts/packaging/package-terminal-runtime.mjs';
 import { buildOwnerWorkers } from '../../scripts/packaging/owner-workers.mjs';
+import { buildAssetsRuntime } from '../../scripts/packaging/package-assets-runtime.mjs';
 await buildTranscriptCacheRuntime(fileURLToPath(new URL('./dist/', import.meta.url)));
 await buildDshRoutingRuntime(fileURLToPath(new URL('./dist/', import.meta.url)));
 await buildServerSpacesRuntime(fileURLToPath(new URL('./dist/', import.meta.url)));
 await buildConnectedAgentHistoryRuntime(fileURLToPath(new URL('./dist/', import.meta.url)));
 await buildTerminalOwnerRuntime(fileURLToPath(new URL('./dist/', import.meta.url)));
 await buildOwnerWorkers(fileURLToPath(new URL('./dist/', import.meta.url)), { target: 'node26' });
+// The desktop account service the daemon hosts serves Assets; its vault Worker lives beside the daemon.
+await buildAssetsRuntime(fileURLToPath(new URL('./dist/', import.meta.url)));
 await build({entryPoints:['src/execution-fault.worker.ts'],outfile:'dist/execution-fault-worker.mjs',bundle:true,platform:'node',format:'esm',target:'node26'});
 await build(daemonMainBundle);
 
@@ -22,3 +25,17 @@ await build({entryPoints:['../../apps/personal-assistant/src/runtime/assistant-s
 
 await (await import('node:fs/promises')).copyFile('../../apps/personal-assistant/src/adapters/sqlite/schema.sql','dist/schema.sql');
 await build({ entryPoints: ["../agent-bridge-host/src/storage.worker.ts"], outfile: "dist/storage.worker.mjs", bundle: true, platform: "node", format: "esm", banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" } });
+
+// The Codex bridge stack the daemon launches with --codex-bridge-stack (see src/codex-bridge-stack.ts).
+const requireBanner = { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" };
+for (const [source, target, format] of [
+  ['../codex-core/src/bin.ts', 'codex-core.cjs', 'cjs'],
+  ['../codex-core/src/app-server-bin.ts', 'codex-app-server.cjs', 'cjs'],
+  ['../codex-core/src/generation-registry.worker.ts', 'generation-registry-worker.mjs', 'esm'],
+  ['../codex-core/src/router-evidence.worker.ts', 'router-evidence-worker.mjs', 'esm'],
+  ['../agent-bridge-host/src/main.ts', 'engine-host.mjs', 'esm'],
+  ['../agent-bridge-host/src/storage.worker.ts', 'storage.worker.mjs', 'esm'],
+  ['../agent-bridge-host/src/codex-main.ts', 'codex.cjs', 'cjs'],
+]) await build({ entryPoints: [source], outfile: `dist/codex-bridge/${target}`, bundle: true, platform: 'node', format, target: 'node24',
+  external: ['node-pty'], ...(format === 'esm' ? { banner: requireBanner } : {}) });
+await (await import('node:fs/promises')).copyFile('src/codex-bridge-exit-with-parent.cjs', 'dist/codex-bridge/exit-with-parent.cjs');

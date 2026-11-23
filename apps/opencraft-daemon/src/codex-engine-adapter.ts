@@ -48,6 +48,7 @@ import { mkdir, stat } from "node:fs/promises";
 import { createInterface, type Interface as ReadLineInterface } from "node:readline";
 import { join } from "node:path";
 import { OpenCraftHostQueue, type HostQueuedSubmission } from "./opencraft-host-queue.js";
+import { dispatchQueuedStart, dispatchQueuedSteer, reconcileThreadQueue } from "@opencraft/thread-queue";
 import { OpenCraftHostStateDatabase } from "./opencraft-host-state-database.js";
 import { OpenCraftTokenUsageLedger, type UsageSubmission } from "./token-usage-ledger.js";
 import { CodexTokenUsageRuntime } from "./token-usage-runtime.js";
@@ -335,7 +336,11 @@ interface LocalCodexEngineOptions extends SharedCodexRoutingOptions {
     admission: (requestId: string | number) => CodexNativeRequestAdmission | null) => DuplexTransport;
   /** Opt in before migrating a legacy embedded writer to independently owned core storage. */
   readonly writerOwnership?: boolean;
+  /** Tasks belong to a Host services front; this Host opens no tasks store. */
+  readonly externalTasks?: boolean;
   readonly executable: string;
+  /** Builtin (bundled, pinned), user-installed, explicit or unresolved; diagnostics only. */
+  readonly executableSource?: "explicit" | "builtin" | "user-installed" | "unresolved";
   readonly runtimeDirectory: string;
   readonly modelPolicyPath?: string;
   readonly dataDirectory: string;
@@ -694,7 +699,8 @@ export class CodexEngineAdapter implements DuplexTransport {
       this.attachmentStaging = null;
       return;
     }
-    this.tasks = new TasksService(options.kind === "remote" ? null : join(options.dataDirectory, "tasks.sqlite"), () => {
+    // A Host services front may own tasks; then this Host opens no tasks store.
+    this.tasks = options.kind !== "remote" && options.externalTasks ? null : new TasksService(options.kind === "remote" ? null : join(options.dataDirectory, "tasks.sqlite"), () => {
       for (const subscriber of this.initializedClients) this.emit({ method: "opencraft/tasks/changed", params: {} }, subscriber);
     });
     this.attachmentStaging = options.kind === "remote"
@@ -1023,7 +1029,7 @@ export class CodexEngineAdapter implements DuplexTransport {
           projectLegacy:derived?false:undefined,submission:!!this.options.tokenUsage?.submission,derived:!!derived,
           ...(this.nativeCore&&this.options.coreEndpoint?{coreEndpoint:this.options.coreEndpoint,coreAuthToken:this.options.coreAuthToken??""}:{})},{
           request:(method,params)=>this.requestPhysical(method,params,5000),
-          submission:this.options.tokenUsage?.submission,
+          submission:this.usageSubmissionByRecord(),
           diagnostic:category=>this.diagnostic({event:"token-usage-partial",category}),
           invalidate:derived?(threadId,path)=>derived.invalidate(threadId,path):undefined,
           failed:()=>{this.tokenUsage=null;this.diagnostic({event:"token-usage-unavailable",category:"collector-exit"});},
@@ -1031,7 +1037,7 @@ export class CodexEngineAdapter implements DuplexTransport {
       } else this.tokenUsage = new CodexTokenUsageRuntime(new OpenCraftTokenUsageLedger(this.tokenUsageState,this.options.tokenUsage?.serverId ?? "local-codex",Date.now,telemetry,{projectLegacy:this.options.tokenUsage?.derivedQueries?false:undefined}), {
         request:(method,params)=>this.requestPhysical(method,params,5000),
         source:(threadId,path)=>nativeStorage.resolve(threadId,path),
-        submission:this.options.tokenUsage?.submission,
+        submission:this.usageSubmissionByRecord(),
         diagnostic:category=>this.diagnostic({event:"token-usage-partial",category}),
         derived:this.options.tokenUsage?.derivedQueries,
       });
@@ -1191,7 +1197,8 @@ export class CodexEngineAdapter implements DuplexTransport {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
-    this.diagnostic({ event: "appserver-start", pid: child.pid ?? null });
+    this.diagnostic({ event: "appserver-start", pid: child.pid ?? null,
+      ...(this.options.executableSource ? { executableSource: this.options.executableSource } : {}) });
     child.stderr.on("data", chunk => { this.stderrTail = `${this.stderrTail}${String(chunk)}`.slice(-4_000); });
     this.lines = createInterface({ input: child.stdout });
     this.lines.on("line", this.receivePhysicalLine);
@@ -1720,7 +1727,8 @@ export class CodexEngineAdapter implements DuplexTransport {
       }
       if (message.method.startsWith("opencraft/tasks/")) {
         try {
-          const result = this.tasks!.handle(message.method, message.params);
+          if (!this.tasks) throw new TasksFault(-32601, "Tasks are served by this Host's services layer");
+          const result = this.tasks.handle(message.method, message.params);
           this.reportStorage();
           this.emit({ id, result }, clientId);
         } catch (error) {
@@ -1981,12 +1989,9 @@ export class CodexEngineAdapter implements DuplexTransport {
           const inputId = string(params.clientUserMessageId);
           const usageRuntime=this.tokenUsage,physicalGeneration=this.sessionMcpGeneration;
           try {
-            const actor=context.actorContext ? this.options.tokenUsage?.actor(context.actorContext) : null;
-            const trusted=this.options.tokenUsage?.submission?.(string(params.threadId),inputId);
+            const mode=message.method === "turn/start" ? "start":"steer";
             pending.usageAttemptId=randomUUID();
-            await usageRuntime?.attempt(pending.usageAttemptId,string(params.threadId),inputId,message.method === "turn/start" ? "start":"steer",{threadId:string(params.threadId),inputId,actorId:trusted?.sourceKind==="system"?trusted.actorId:actor?.id??trusted?.actorId??null,
-              actorKind:trusted?.sourceKind==="system"?trusted.actorKind:actor?.kind??trusted?.actorKind??"unknown",mode:message.method === "turn/start" ? "start":"steer",
-              sourceKind:trusted?.sourceKind === "system" ? "system" : actor?.kind === "human" ? "human":actor?.kind === "session" ? "system":trusted?.sourceKind??"unknown",submittedAt:Date.now()});
+            await usageRuntime?.attempt(pending.usageAttemptId,string(params.threadId),inputId,mode,this.usageIdentity(string(params.threadId),string(params.threadId),inputId,mode,context));
           } catch { this.diagnostic({event:"token-usage-partial",category:"submission"}); }
           if(!this.initializedClients.has(clientId)||this.clientEpoch(clientId)!==requestClientEpoch||this.statusValue.state!=="open"||physicalGeneration!==this.sessionMcpGeneration){
             if(pending.usageAttemptId)usageRuntime?.attemptOutcome(pending.usageAttemptId,"rejected");return;
@@ -3318,9 +3323,11 @@ export class CodexEngineAdapter implements DuplexTransport {
       if (method === OPENCRAFT_DESKTOP_ATTACH) {
         if (Object.keys(params).length !== 1 || typeof params.threadId !== "string") throw new Error();
         const owner: LocalDesktopOwner = { key, isCurrent: current, readThread: async threadId => {
-          const response = record(await this.requestPhysical("thread/read", { threadId, includeTurns: false }, 5_000));
+          // A bridge Thread is read by its native session; the binding keeps its public identity.
+          const nativeId = this.externalThreadIdentities?.toNative(threadId) ?? threadId;
+          const response = record(await this.requestPhysical("thread/read", { threadId: nativeId, includeTurns: false }, 5_000));
           const thread = record(response.thread);
-          if (thread.id !== threadId || typeof thread.path !== "string" || typeof thread.createdAt !== "number") throw new Error();
+          if (thread.id !== nativeId || typeof thread.path !== "string" || typeof thread.createdAt !== "number") throw new Error();
           return { id: threadId, path: thread.path, createdAt: thread.createdAt };
         } };
         const credential = await service.prepare(owner, params.threadId);
@@ -3664,6 +3671,133 @@ export class CodexEngineAdapter implements DuplexTransport {
   private queueStore(): OpenCraftHostQueue {
     if (!this.queue) throw new Error("Host queue is unavailable");
     return this.queue;
+  }
+
+  /**
+   * Stage attachments for a Thread this Host does not execute (a bridge Thread):
+   * the same model-readable locator as local Threads, recorded for display.
+   */
+  async prepareExternalInput(threadId: string, clientId: string | undefined, input: readonly unknown[], context?: TransportSubmissionContext): Promise<unknown[]> {
+    // Attribution is recorded before anything is staged, exactly as for this Host's own Threads.
+    if (context && (clientId || context.sender)) {
+      if (!this.identity) {
+        if (context.sender) throw new Error("Message sender storage is unavailable");
+      } else this.identity.recordSubmission({ threadId, clientUserMessageId: clientId ?? "" }, context);
+    }
+    const prepared = await this.modelVisibleAttachmentInput(input, threadId, clientId, context);
+    if (clientId && prepared.attachments.length > 0 && this.messageAttachments) this.messageAttachments.record(threadId, clientId, prepared.attachments);
+    return prepared.input;
+  }
+  /** A bridge Thread's live notification with the sender recorded by prepareExternalInput. */
+  projectExternalNotification(message: RpcRecord): RpcRecord {
+    return this.messageSenders ? projectThreadMessageNotification(this.projectSender, message) as RpcRecord : message;
+  }
+  /** The trusted submission lookup for collection, which names bridge Threads by their native session. */
+  private usageSubmissionByRecord() {
+    const submission = this.options.tokenUsage?.submission;
+    return submission ? (threadId: string, inputId: string) => submission(this.externalThreadIdentities?.toPublic?.(threadId) ?? threadId, inputId) : undefined;
+  }
+  private externalThreadIdentities?: { toNative(threadId: string): string | undefined; toPublic?(nativeId: string): string | undefined };
+  /** The provider bridge's public↔native Thread identities, for Host duties it forwards here. */
+  bindExternalThreadIdentities(identities: { toNative(threadId: string): string | undefined; toPublic?(nativeId: string): string | undefined }): void { this.externalThreadIdentities = identities; }
+  /** Who submitted an input, for usage attribution: the trusted owner's record, else the submitting actor. */
+  private usageIdentity(recordThreadId: string, publicThreadId: string, inputId: string, mode: "start" | "steer", context: TransportSubmissionContext): UsageSubmission {
+    const actor=context.actorContext ? this.options.tokenUsage?.actor(context.actorContext) : null;
+    const trusted=this.options.tokenUsage?.submission?.(publicThreadId,inputId);
+    return {threadId:recordThreadId,inputId,actorId:trusted?.sourceKind==="system"?trusted.actorId:actor?.id??trusted?.actorId??null,
+      actorKind:trusted?.sourceKind==="system"?trusted.actorKind:actor?.kind??trusted?.actorKind??"unknown",mode,
+      sourceKind:trusted?.sourceKind === "system" ? "system" : actor?.kind === "human" ? "human":actor?.kind === "session" ? "system":trusted?.sourceKind??"unknown",submittedAt:Date.now()};
+  }
+  /** A bridge Thread's turn notification, with native session and turn identities, for usage collection. */
+  observeExternalUsage(method: string, params: RpcRecord): void {
+    try { this.tokenUsage?.notification(method, params); } catch { this.diagnostic({event:"token-usage-partial",category:"notification"}); }
+  }
+  /** A bridge Thread's input is about to be submitted: record who submitted it, under its native session. */
+  async beginExternalUsage(nativeThreadId: string, publicThreadId: string, inputId: string, mode: "start" | "steer", context: TransportSubmissionContext): Promise<string | undefined> {
+    const usage=this.tokenUsage;
+    if(!usage||!nativeThreadId||!inputId)return undefined;
+    try {
+      const attemptId=randomUUID();
+      await usage.attempt(attemptId,nativeThreadId,inputId,mode,this.usageIdentity(nativeThreadId,publicThreadId,inputId,mode,context));
+      return attemptId;
+    } catch { this.diagnostic({event:"token-usage-partial",category:"submission"}); return undefined; }
+  }
+  /** Its outcome: accepted into a native turn (and admitted to it), rejected, or unknown. */
+  settleExternalUsage(attemptId: string, outcome: "accepted" | "rejected" | "unknown", nativeThreadId: string, inputId: string, nativeTurnId?: string): void {
+    try {
+      this.tokenUsage?.attemptOutcome(attemptId,outcome,outcome==="accepted"?nativeTurnId??null:null);
+      if(outcome==="accepted"&&nativeTurnId)this.tokenUsage?.admission({threadId:nativeThreadId,turnId:nativeTurnId},inputId);
+    } catch { this.diagnostic({event:"token-usage-partial",category:"acceptance"}); }
+  }
+  /**
+   * A bridge Thread's queue request, checked as this Host checks its own queue: Actor
+   * input only through its trusted admission and immutable, a person's delete of Actor
+   * input becomes a collaboration cancel, ordinary input is authorized before it is
+   * queued. Returns a reply this Host answers itself, or null to forward the request.
+   * The Engine Host dispatches queued input on its own, so authorization is checked
+   * when input is queued or steered rather than again at dispatch.
+   */
+  async guardExternalQueue(threadId: string, method: string, params: RpcRecord, context: TransportSubmissionContext,
+    find: (by: { queuedSubmissionId: string } | { clientUserMessageId: string }) => Promise<{ id: string; clientUserMessageId: string; state: string; targetTurnId: string | null } | null>): Promise<{ result: RpcRecord } | null> {
+    const actorRequest = context.collaborationRequestId;
+    const selected = string(params.queuedSubmissionId) ? await find({ queuedSubmissionId: string(params.queuedSubmissionId) }) : null;
+    const clientId = selected?.clientUserMessageId ?? string(params.clientUserMessageId);
+    const actorInput = clientId.startsWith('actor-input:');
+    if (selected && actorInput && method === 'thread/queue/delete' && !actorRequest && context.actorContext && this.options.collaboration) {
+      await this.options.collaboration.command(context.actorContext, { action: 'cancel', requestId: clientId.slice('actor-input:'.length) });
+      return { result: { deleted: true } };
+    }
+    if (actorInput && clientId !== `actor-input:${actorRequest}`) throw new OpenCraftQueueRpcError(-32600, 'Actor input requires its trusted admission');
+    if (actorInput && method === 'thread/queue/update') throw new OpenCraftQueueRpcError(-32600, 'Actor messages are immutable');
+    if (method === 'thread/queue/collaborationReceipt') {
+      if (!actorRequest) throw new OpenCraftQueueRpcError(-32600, 'Trusted Actor admission required');
+      const row = await find({ clientUserMessageId: `actor-input:${actorRequest}` });
+      return { result: { receipt: row ? { id: row.id, state: row.state, targetTurnId: row.targetTurnId } : null } };
+    }
+    if (method === 'thread/queue/add') {
+      if (actorInput) {
+        const mode = this.options.collaborationInput?.mode(clientId);
+        if (!mode) throw new OpenCraftQueueRpcError(-32600, 'Actor request unavailable');
+        if (mode === 'queue' && !this.options.collaborationInput?.authorize(threadId, clientId, mode)) throw new OpenCraftQueueRpcError(-32600, 'Actor execution authorization changed');
+      } else if (context.actorContext && this.options.collaboration) {
+        context.resourceOwner?.assertCurrent();
+        this.options.collaboration.authorize(context.actorContext, threadId, clientId, Array.isArray(params.input) ? params.input : []);
+      }
+    }
+    if (method === 'thread/queue/steer' && actorInput
+      && !this.options.collaborationInput?.authorize(threadId, clientId, 'steer', string(params.expectedTurnId) || undefined))
+      throw new OpenCraftQueueRpcError(-32600, 'Actor execution authorization changed');
+    return null;
+  }
+  /** Whether this Host can record verified senders for a bridge Thread's input. */
+  get externalSenderAttribution(): boolean { return !!this.identity; }
+  /**
+   * Let the bridge adopt one of this Host's Threads. Only a Thread with no turn,
+   * queued or unknown input, goal, retry, recovery, title job, active schedule,
+   * pending approval or admission in flight is released; this Host then stops
+   * observing it. Nothing is executed or discarded.
+   */
+  async releaseForAdoption(threadId: string): Promise<boolean> {
+    // A pass-through to Core keeps no thread state here, so this Host cannot vouch that a Thread is idle.
+    if (!threadId || this.closeOperation || this.coreBridge) return false;
+    return this.withThreadOperation(threadId, async () => {
+      if (this.executionBlocked(threadId) || this.generationUsageSnapshot().blockedThreadIds.includes(threadId)) return false;
+      if (this.nativeSubscribedThreads.has(threadId)) {
+        await this.requestPhysical("thread/unsubscribe", { threadId });
+        this.nativeSubscribedThreads.delete(threadId);
+      }
+      return true;
+    });
+  }
+  /** Title generation for a bridge Thread, observed by its native identity. */
+  observeExternalTitle(method: string, params: RpcRecord, result: unknown): void { this.threadTitles?.observeResult(method, params, result); }
+  /** Attachments recorded by prepareExternalInput, projected onto that Thread's history. */
+  projectExternalHistory(method: string, params: RpcRecord, result: unknown): unknown {
+    const attached = this.messageAttachments ? projectThreadAttachmentResult(this.messageAttachments, method, params, result) : result;
+    // Senders recorded by prepareExternalInput, as on this Host's own history.
+    return this.messageSenders
+      ? projectThreadMessageResult(this.projectSender, method, params, attached, { trustedSubmissionSender: true })
+      : attached;
   }
 
   private attachmentRecords(): OpenCraftMessageAttachments {
@@ -4175,56 +4309,13 @@ export class CodexEngineAdapter implements DuplexTransport {
   }
 
   private async reconcileQueue(threadId: string, receiptTurnIds?: readonly string[]): Promise<void> {
-    const queue = this.queueStore();
-    const unsettled = queue.list(threadId,receiptTurnIds).filter(row => row.state === "unknown" || row.state === "steering" || row.state === "closed");
-    const terminal = new Map<string,Promise<RpcRecord|undefined>>();
-    let idle: boolean | undefined;
-    for (const row of unsettled) {
-      if (row.pausedReason === "delivery-retry-requested" && (row.delivery?.nativeAdmission === "accepted" || row.delivery?.context === "recorded")) {
-        queue.resumeRequestedRetry(threadId,row.id); // Positive evidence retires the retry, never requeues it.
-        this.emitQueueChanged(threadId);
-      }
-      const target = row.targetTurnId === "unknown" ? null : row.targetTurnId;
-      if (await this.historyHasClientMessage(threadId,row.clientUserMessageId,target)) {
-        queue.deliveries.recorded(threadId,row.clientUserMessageId);
-        queue.settle(threadId,row.id,"delivered");
-        this.emitQueueChanged(threadId);
-        continue;
-      } else if ((row.state === "unknown" || row.state === "closed") && row.pausedReason === "delivery-retry-requested"
-          && row.delivery?.nativeAdmission !== "accepted"
-          && await this.queueThreadIsIdle(threadId)) {
-        // Only this explicit retry can re-enter the queue. Recheck final history
-        // after idle; a positive native ACK is never a retry authorization.
-        if (await this.historyHasClientMessage(threadId,row.clientUserMessageId,target)) {
-          queue.deliveries.recorded(threadId,row.clientUserMessageId);
-          queue.settle(threadId,row.id,"delivered");
-        } else {
-          // Idle alone is insufficient. If the terminal notification was lost,
-          // recover its exact Turn before consuming the durable retry intent.
-          if (!inputExecutionEnded(row.delivery) && target) {
-            const turn=await this.findScheduledTurn(threadId,target);
-            if (turn && ['completed','failed','interrupted'].includes(string(turn.status))) queue.deliveries.finish(threadId,target,string(turn.status));
-          }
-          queue.resumeRequestedRetry(threadId,row.id);
-        }
-        this.emitQueueChanged(threadId);
-        continue;
-      }
-      if (inputExecutionEnded(row.delivery)) continue;
-      // Idle by itself says nothing about a particular attempt. Recover its
-      // exact terminal Turn, including after a lost notification/restart.
-      idle ??= await this.queueThreadIsIdle(threadId);
-      if (!idle || !target) continue;
-      let lookup=terminal.get(target);
-      if (!lookup) { lookup=this.findScheduledTurn(threadId,target); terminal.set(target,lookup); }
-      const turn=await lookup;
-      if (turn && ['completed','failed','interrupted'].includes(string(turn.status))) {
-        if (this.activeTurns.get(threadId)===target) this.activeTurns.delete(threadId);
-        if (queue.deliveries.finish(threadId,target,string(turn.status))) this.emitQueueChanged(threadId);
-      }
-      // No positive context evidence is fabricated. A closed attempt survives
-      // as Host-authored transcript content, and no longer fences later input.
-    }
+    await reconcileThreadQueue(this.queueStore(), threadId, {
+      historyHasInput: (clientId, target) => this.historyHasClientMessage(threadId, clientId, target),
+      isIdle: () => this.queueThreadIsIdle(threadId),
+      findTurn: target => this.findScheduledTurn(threadId, target),
+      turnEnded: target => { if (this.activeTurns.get(threadId) === target) this.activeTurns.delete(threadId); },
+      changed: () => this.emitQueueChanged(threadId),
+    }, receiptTurnIds);
   }
 
   private actorInput(row: HostQueuedSubmission, mode: 'queue' | 'steer', expectedTurnId?: string): void {
@@ -4280,51 +4371,46 @@ export class CodexEngineAdapter implements DuplexTransport {
   }
   private async dispatchQueuedStart(threadId: string, id: string, context?:TransportSubmissionContext): Promise<RpcRecord> {
     if (this.executionBlocked(threadId)) throw new RecoveryNotSubmitted("Execution is recovering before queue dispatch");
-    const queue = this.queueStore();
-    const head = queue.firstAwaitingAdmission(threadId);
-    if (head?.state === "unknown") throw new OpenCraftQueueRpcError(-32600, "Managed input delivery or execution recovery is still unconfirmed");
-    if (head?.state === "dispatching") throw new OpenCraftQueueRpcError(-32600, "Earlier delivery is still being sent");
-    const queued = queue.find(threadId, id);
-    if (queued && !queued.executionSubmission) this.executionLeases?.capture(threadId, queued.clientUserMessageId, { principal: null, ownership: "unknown" });
-    if (!queued) throw new OpenCraftQueueRpcError(-32600, "Queued message is unavailable");
-    if (!context && this.options.requiresWorkspaceResume?.(threadId)) {
-      const restore = this.options.collaboration?.restoreWorkspaceSubmission;
-      if (!restore) throw new OpenCraftQueueRpcError(-32600, 'Workspace queued execution authority unavailable');
-      context = await restore(threadId, queued.clientUserMessageId, queued.executionSubmission ?? undefined);
-      context.resourceOwner?.assertCurrent();
-    }
-    const prepared = await this.modelVisibleAttachmentInput(queued.input, threadId, undefined, context);
-    if (prepared.attachments.length > 0) this.attachmentRecords().record(
-      threadId, queued.clientUserMessageId, prepared.attachments);
-    const referenceContext = await this.options.collaboration?.queuedContext?.(threadId, queued.clientUserMessageId, prepared.input);
-    this.actorInput(queued, 'queue');
-    const selection = this.schedules?.executionPermissions(threadId, queued.clientUserMessageId);
-    const thread = selection ? record(record(await this.requestPhysical("thread/read", { threadId, includeTurns: false })).thread) : null;
-    const permissions = selection ? await this.resolvePermissionSelection(selection, thread?.cwd) : {};
-    const row = queue.claim(threadId, id, "unknown");
-    if (!row) throw new OpenCraftQueueRpcError(-32600, "Queued message is already being dispatched");
-    this.emitQueueChanged(threadId);
-    try {
-      const response = record(await this.requestPhysical("turn/start", {
-        threadId, input: prepared.input, clientUserMessageId: row.clientUserMessageId,
-        ...permissions,
-        ...(referenceContext ? {additionalContext:{"opencraft.conversations":{kind:"untrusted",value:JSON.stringify(referenceContext)}}} : {}),
-      },30_000,undefined,this.queuedUsageIdentity(context,threadId,row.clientUserMessageId,"start"),undefined,context));
-      if (!string(record(response.turn).id)) throw new Error("Codex returned an invalid turn/start acknowledgement");
-      queue.settle(threadId, id, "delivered", null, string(record(response.turn).id));
-      this.emitQueueChanged(threadId);
-      return response;
-    } catch (error) {
-      const unsent = error instanceof RecoveryNotSubmitted;
-      const preparation = unsent && error.cause instanceof SessionMcpPreparationFailure ? error.cause : null;
-      const retryable = unsent && (!preparation || sessionMcpRetryable(preparation.cause));
-      queue.settle(threadId, id, unsent || error instanceof ModelPolicyError ? "queued" : "unknown",
-        error instanceof ModelPolicyError ? "model-restricted" : unsent && this.executionBlocked(threadId) ? "execution-recovering" : unsent
-          ? retryable ? "session-tools-recovering" : "session-tools-unavailable" : "steer-delivery-unconfirmed");
-      if (retryable) this.scheduleQueuePreparationRetry(threadId);
-      this.emitQueueChanged(threadId);
-      throw error;
-    }
+    return dispatchQueuedStart(this.queueStore(), threadId, id, {
+      refuse: message => { throw new OpenCraftQueueRpcError(-32600, message); },
+      prepare: async queued => {
+        if (!queued.executionSubmission) this.executionLeases?.capture(threadId, queued.clientUserMessageId, { principal: null, ownership: "unknown" });
+        if (!context && this.options.requiresWorkspaceResume?.(threadId)) {
+          const restore = this.options.collaboration?.restoreWorkspaceSubmission;
+          if (!restore) throw new OpenCraftQueueRpcError(-32600, 'Workspace queued execution authority unavailable');
+          context = await restore(threadId, queued.clientUserMessageId, queued.executionSubmission ?? undefined);
+          context.resourceOwner?.assertCurrent();
+        }
+        const prepared = await this.modelVisibleAttachmentInput(queued.input, threadId, undefined, context);
+        if (prepared.attachments.length > 0) this.attachmentRecords().record(
+          threadId, queued.clientUserMessageId, prepared.attachments);
+        const referenceContext = await this.options.collaboration?.queuedContext?.(threadId, queued.clientUserMessageId, prepared.input);
+        this.actorInput(queued, 'queue');
+        const selection = this.schedules?.executionPermissions(threadId, queued.clientUserMessageId);
+        const thread = selection ? record(record(await this.requestPhysical("thread/read", { threadId, includeTurns: false })).thread) : null;
+        const permissions = selection ? await this.resolvePermissionSelection(selection, thread?.cwd) : {};
+        return { input: prepared.input, referenceContext, permissions };
+      },
+      send: async (row, prepared) => {
+        const response = record(await this.requestPhysical("turn/start", {
+          threadId, input: prepared.input, clientUserMessageId: row.clientUserMessageId,
+          ...prepared.permissions,
+          ...(prepared.referenceContext ? {additionalContext:{"opencraft.conversations":{kind:"untrusted",value:JSON.stringify(prepared.referenceContext)}}} : {}),
+        },30_000,undefined,this.queuedUsageIdentity(context,threadId,row.clientUserMessageId,"start"),undefined,context));
+        if (!string(record(response.turn).id)) throw new Error("Codex returned an invalid turn/start acknowledgement");
+        return { turnId: string(record(response.turn).id), response };
+      },
+      failed: error => {
+        const unsent = error instanceof RecoveryNotSubmitted;
+        const preparation = unsent && error.cause instanceof SessionMcpPreparationFailure ? error.cause : null;
+        const retryable = unsent && (!preparation || sessionMcpRetryable(preparation.cause));
+        return { state: unsent || error instanceof ModelPolicyError ? "queued" : "unknown",
+          reason: error instanceof ModelPolicyError ? "model-restricted" : unsent && this.executionBlocked(threadId) ? "execution-recovering" : unsent
+            ? retryable ? "session-tools-recovering" : "session-tools-unavailable" : "steer-delivery-unconfirmed",
+          ...(retryable ? { after: () => this.scheduleQueuePreparationRetry(threadId) } : {}) };
+      },
+      changed: () => this.emitQueueChanged(threadId),
+    });
   }
 
   /** This fence is only for commands that consume installed personal ENV.
@@ -4367,76 +4453,63 @@ export class CodexEngineAdapter implements DuplexTransport {
   }
 
   private async dispatchQueuedSteer(threadId: string, id: string, expectedTurnId: string, context?:TransportSubmissionContext, additionalContext?: unknown, canDispatch?:()=>boolean): Promise<RpcRecord> {
-    const queue = this.queueStore();
-    const previous=queue.find(threadId,id);
-    if (previous && (previous.delivery?.nativeAdmission==='accepted' || inputExecutionEnded(previous.delivery))) {
-      if (previous.targetTurnId!==expectedTurnId) throw new OpenCraftQueueRpcError(-32600,"Message identity already belongs to another Turn");
-      return {turnId:expectedTurnId,delivery:previous.delivery};
-    }
-    if (queue.firstAwaitingAdmission(threadId)?.state === "unknown") await this.reconcileQueue(threadId,[]);
-    const head = queue.firstAwaitingAdmission(threadId);
-    if (head?.state === "unknown") throw new OpenCraftQueueRpcError(-32600, "Managed input delivery is still unconfirmed");
-    if (head?.state === "dispatching") throw new OpenCraftQueueRpcError(-32600, "Earlier delivery is still being sent");
-    const queued = queue.find(threadId, id);
-    if (!queued) throw new OpenCraftQueueRpcError(-32600, "Queued message is unavailable");
-    if (this.options.executionEnvironment) {
-      const submission = queued.executionSubmission;
-      if (!submission || submission.ownership === 'unknown') throw new OpenCraftQueueRpcError(-32600, 'Execution identity is unavailable',
-        { notSubmitted: true, submissionOutcome: 'rejected', retryable: false });
-      // The queued input's provenance is independent of the target executor.
-      // Do not manufacture or replace either identity from an ENV cache.
-    }
-    if (!context && this.options.requiresWorkspaceResume?.(threadId)) {
-      const restore = this.options.collaboration?.restoreWorkspaceSubmission;
-      if (!restore) throw new OpenCraftQueueRpcError(-32600, 'Workspace queued execution authority unavailable');
-      context = await restore(threadId, queued.clientUserMessageId, queued.executionSubmission ?? undefined);
-      context.resourceOwner?.assertCurrent();
-    }
-    const prepared = await this.modelVisibleAttachmentInput(queued.input, threadId, undefined, context);
-    if (prepared.attachments.length > 0) this.attachmentRecords().record(
-      threadId, queued.clientUserMessageId, prepared.attachments);
-    if (context) {
-      this.validateSubmissionContext(context);
-      if (context.actorContext && this.options.collaboration?.prepare) {
-        const referenceContext=await this.options.collaboration.prepare(context.actorContext,prepared.input);
-        if (referenceContext) additionalContext={...record(additionalContext),'opencraft.conversations':{kind:'untrusted',value:JSON.stringify(referenceContext)}};
-      }
-      this.validateSubmissionContext(context);
-      if (context.actorContext && this.options.collaboration) {
-        context.resourceOwner?.assertCurrent();
-        this.options.collaboration.authorize(context.actorContext,threadId,queued.clientUserMessageId,prepared.input);
-      }
-    }
-    if (this.options.sharedTurnInput) await this.assertNativeTurnInputReady(threadId);
-    if (context) this.validateSubmissionContext(context);
-    if (canDispatch?.()===false) throw new RecoveryNotSubmitted('Sending client was replaced before native submission');
-    if (inputExecutionEnded(queue.deliveries.receipt(threadId,queued.clientUserMessageId,expectedTurnId)))
-      throw new OpenCraftQueueRpcError(-32600,"no active turn to steer");
-    this.actorInput(queued, 'steer', expectedTurnId);
-    const row = queue.claim(threadId, id, expectedTurnId);
-    if (!row) throw new OpenCraftQueueRpcError(-32600, "Queued message is already being dispatched");
-    this.emitQueueChanged(threadId);
-    try {
-      const response = record(await this.requestPhysical("turn/steer", {
-        threadId, expectedTurnId, input: prepared.input, clientUserMessageId: row.clientUserMessageId,
-        ...(additionalContext === undefined ? {} : {additionalContext}),
-      },30_000,undefined,this.queuedUsageIdentity(context,threadId,row.clientUserMessageId,"steer"),()=>{
-        if(context)this.validateSubmissionContext(context);
-        return canDispatch?.()!==false;
-      },context));
-      const turnId = string(response.turnId) || string(record(response.turn).id);
-      if (turnId !== expectedTurnId) throw new Error("Codex returned an invalid steer acknowledgement");
-      queue.settle(threadId, id, "steering");
-      this.emitQueueChanged(threadId);
-      return { turnId, delivery: queue.find(threadId,id)?.delivery };
-    } catch (error) {
-      const unsent = error instanceof RecoveryNotSubmitted;
-      const rejected = unsent || this.definitiveSteerRejection(error);
-      queue.settle(threadId, id, rejected ? "queued" : "unknown",
-        unsent && this.executionBlocked(threadId) ? "execution-recovering" : rejected ? null : "steer-delivery-unconfirmed");
-      this.emitQueueChanged(threadId);
-      throw error;
-    }
+    return dispatchQueuedSteer(this.queueStore(), threadId, id, expectedTurnId, {
+      refuse: message => { throw new OpenCraftQueueRpcError(-32600, message); },
+      prepare: async queued => {
+        if (this.options.executionEnvironment) {
+          const submission = queued.executionSubmission;
+          if (!submission || submission.ownership === 'unknown') throw new OpenCraftQueueRpcError(-32600, 'Execution identity is unavailable',
+            { notSubmitted: true, submissionOutcome: 'rejected', retryable: false });
+          // The queued input's provenance is independent of the target executor.
+          // Do not manufacture or replace either identity from an ENV cache.
+        }
+        if (!context && this.options.requiresWorkspaceResume?.(threadId)) {
+          const restore = this.options.collaboration?.restoreWorkspaceSubmission;
+          if (!restore) throw new OpenCraftQueueRpcError(-32600, 'Workspace queued execution authority unavailable');
+          context = await restore(threadId, queued.clientUserMessageId, queued.executionSubmission ?? undefined);
+          context.resourceOwner?.assertCurrent();
+        }
+        const prepared = await this.modelVisibleAttachmentInput(queued.input, threadId, undefined, context);
+        if (prepared.attachments.length > 0) this.attachmentRecords().record(
+          threadId, queued.clientUserMessageId, prepared.attachments);
+        if (context) {
+          this.validateSubmissionContext(context);
+          if (context.actorContext && this.options.collaboration?.prepare) {
+            const referenceContext=await this.options.collaboration.prepare(context.actorContext,prepared.input);
+            if (referenceContext) additionalContext={...record(additionalContext),'opencraft.conversations':{kind:'untrusted',value:JSON.stringify(referenceContext)}};
+          }
+          this.validateSubmissionContext(context);
+          if (context.actorContext && this.options.collaboration) {
+            context.resourceOwner?.assertCurrent();
+            this.options.collaboration.authorize(context.actorContext,threadId,queued.clientUserMessageId,prepared.input);
+          }
+        }
+        if (this.options.sharedTurnInput) await this.assertNativeTurnInputReady(threadId);
+        if (context) this.validateSubmissionContext(context);
+        if (canDispatch?.()===false) throw new RecoveryNotSubmitted('Sending client was replaced before native submission');
+        return prepared.input;
+      },
+      beforeClaim: queued => this.actorInput(queued, 'steer', expectedTurnId),
+      send: async (row, input) => {
+        const response = record(await this.requestPhysical("turn/steer", {
+          threadId, expectedTurnId, input, clientUserMessageId: row.clientUserMessageId,
+          ...(additionalContext === undefined ? {} : {additionalContext}),
+        },30_000,undefined,this.queuedUsageIdentity(context,threadId,row.clientUserMessageId,"steer"),()=>{
+          if(context)this.validateSubmissionContext(context);
+          return canDispatch?.()!==false;
+        },context));
+        const turnId = string(response.turnId) || string(record(response.turn).id);
+        if (turnId !== expectedTurnId) throw new Error("Codex returned an invalid steer acknowledgement");
+        return { turnId, response };
+      },
+      failed: error => {
+        const unsent = error instanceof RecoveryNotSubmitted;
+        const rejected = unsent || this.definitiveSteerRejection(error);
+        return { state: rejected ? "queued" : "unknown",
+          reason: unsent && this.executionBlocked(threadId) ? "execution-recovering" : rejected ? null : "steer-delivery-unconfirmed" };
+      },
+      changed: () => this.emitQueueChanged(threadId),
+    }, () => this.reconcileQueue(threadId, []));
   }
 
   private async handleQueueRequest(clientId: string, id: string | number, method: string, params: RpcRecord, context: TransportSubmissionContext): Promise<void> {
