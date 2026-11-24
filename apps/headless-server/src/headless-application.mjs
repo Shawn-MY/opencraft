@@ -1243,7 +1243,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       },
     }));
     const { serverInformationService } = installation.openServerInformation(fileStateDocumentStore(dataDirectory));
-    const { accountModelDefaultsService, personalSshKeys, actorSshKeysService } = await installation.openPersonalServices({ sshLogin: !!ingressConfiguration });
+    const { accountModelDefaultsService, threadReadReceiptsService, personalSshKeys, actorSshKeysService } = await installation.openPersonalServices({ sshLogin: !!ingressConfiguration });
     const turnPush = lateTurnPush.bind(await installation.openTurnPush({
       openStore: () => openPushStore(join(dataDirectory, 'web-push.sqlite')),
       createService: (store, pushOptions) => new TurnPushService(store, pushOptions),
@@ -1347,6 +1347,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       turnPushService: turnPush,
       serverInformationService,
       accountModelDefaultsService,
+      threadReadReceiptsService,
       actorSshKeysService,
       authService: humanAuth ?? null,
       accountService: accountApplication ?? null,

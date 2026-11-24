@@ -1,14 +1,20 @@
 import type { AppServerClientRegistry } from "@opencraft/appserver-client";
 import type { HostConnectionProfile, TurnCompletionObserver } from "@opencraft/workbench-runtime";
-import { ThreadAttention, parseThreadReadReceipts, type ThreadReadReceiptPort } from "@opencraft/workbench-runtime";
+import { ThreadAttention, parseThreadReadReceipts, type ThreadReadReceiptPort, type ThreadReadReceiptSource } from "@opencraft/workbench-runtime";
 import type { PlatformAccountContributionRegistry } from "./platform-account-contributions";
 
 /** Application lifetime owner. Account authority stores exact read identities;
  * browser storage is a cache/outbox (or local-only fallback without an account port).
+ * A product account's `readReceipts` port takes precedence; otherwise the server's own
+ * logins (`core`) hold the signed-in person's receipts and own that person's browser cache,
+ * while the public scope stays the local one so other local caches keep their partitions.
  * History catch-up borrows connected clients; it never resumes or executes work. */
 export class BrowserThreadAttention {
   private state = new ThreadAttention();
   private scope: string | null = null;
+  /** The signed-in person whose receipts the server source holds, or null. */
+  private person: string | null = null;
+  private failures = 0;
   private revision = 0;
   private epoch = 0;
   private disposed = false;
@@ -29,12 +35,19 @@ export class BrowserThreadAttention {
     source: TurnCompletionObserver, accounts: PlatformAccountContributionRegistry,
     private readonly storage: Pick<Storage, "getItem" | "setItem">,
     private readonly prefix: string,
-    private readonly resetBeforeSeconds = 0) {
+    private readonly resetBeforeSeconds = 0,
+    private readonly core: ThreadReadReceiptSource | null = null) {
     const bind = () => {
       this.stopAccount();
       const account = accounts.getSnapshot().contribution;
-      const refresh = () => this.setScope(account ? account.getSnapshot().readStateScope ?? null : "local", account?.readReceipts);
-      this.stopAccount = account?.subscribe(refresh) ?? (() => {});
+      const server = account?.readReceipts ? null : core;
+      const refresh = () => {
+        const scope = account ? account.getSnapshot().readStateScope ?? null : "local";
+        const person = scope === null ? null : server?.getScope() ?? null;
+        this.setScope(scope, person === null ? account?.readReceipts : server!.port, person);
+      };
+      const stops = [account?.subscribe(refresh), server?.subscribe(refresh)];
+      this.stopAccount = () => { for (const stop of stops) stop?.(); };
       refresh();
     };
     this.stops.push(accounts.subscribe(bind));
@@ -47,7 +60,9 @@ export class BrowserThreadAttention {
     }));
     if (typeof window !== "undefined") {
       const refresh = () => { if (document.visibilityState === "visible") void this.synchronize(); };
-      const timer = window.setInterval(refresh, 15_000);
+      // Polling skips 2^n - 1 ticks (at most 20, about 5 minutes) after n failed refreshes.
+      let skipped = 0;
+      const timer = window.setInterval(() => { if (++skipped >= Math.min(2 ** this.failures, 20)) { skipped = 0; refresh(); } }, 15_000);
       window.addEventListener("focus", refresh);
       window.addEventListener("online", refresh);
       document.addEventListener("visibilitychange", refresh);
@@ -55,24 +70,34 @@ export class BrowserThreadAttention {
         window.removeEventListener("online", refresh); document.removeEventListener("visibilitychange", refresh); });
     }
   }
-  private setScope(scope: string | null, port?: ThreadReadReceiptPort) {
-    if (this.scope === scope && this.port === port) return;
+  private setScope(scope: string | null, port: ThreadReadReceiptPort | undefined, person: string | null) {
+    if (this.scope === scope && this.port === port && this.person === person) return;
     this.controller.abort(); this.controller = new AbortController();
     this.synchronization = null; this.unsent.clear();
     this.port = port; this.hydrated = !port;
     this.stopState();
     this.scope = scope;
+    this.person = person;
+    this.failures = 0;
     this.persistedReceipts = null;
     ++this.epoch;
     this.checked.clear(); this.pending.clear(); this.live.clear();
     let receipts: string[] = [];
     try {
-      const value: unknown = scope === null ? null : JSON.parse(this.storage.getItem(this.storageKey(scope)) ?? "null");
+      let value: unknown = scope === null ? null : JSON.parse(this.storage.getItem(this.storageKey(scope)) ?? "null");
+      if (person !== null) {
+        // The server source owns the person's cache; once per browser, reads made before
+        // the server held them go to the first signed-in person.
+        const imported = `${this.prefix}.server-imported`;
+        value = this.core!.cache.read(person) ?? (this.storage.getItem(imported) === null ? value : null);
+        this.storage.setItem(imported, "1");
+      }
       if (Array.isArray(value)) receipts = value.filter((item): item is string => typeof item === "string");
     } catch { /* Private/disabled storage retains in-memory read semantics. */ }
     this.state = new ThreadAttention(receipts);
     // Import legacy browser reads by union; never replace another device's receipts.
     if (port) for (const receipt of receipts) this.unsent.add(receipt);
+    if (person !== null) this.persistCache(scope!);
     this.stopState = this.state.subscribe(() => { this.publish(); });
     this.publish();
     void this.synchronize();
@@ -94,7 +119,8 @@ export class BrowserThreadAttention {
     const value = JSON.stringify(this.state.receipts());
     if (value === this.persistedReceipts) return;
     try {
-      this.storage.setItem(this.storageKey(scope), value);
+      if (this.person !== null) this.core!.cache.write(this.person, this.state.receipts());
+      else this.storage.setItem(this.storageKey(scope), value);
       this.persistedReceipts = value;
     } catch { /* Retry persistence next time; in-memory outbox remains retryable. */ }
   }
@@ -103,25 +129,26 @@ export class BrowserThreadAttention {
     if (this.synchronization) return this.synchronization;
     const { scope, port, epoch, state } = this;
     if (this.disposed || scope === null || !port) return Promise.resolve();
+    const authority = this.person ?? scope;
     const signal = this.controller.signal;
     const current = () => !this.disposed && !signal.aborted && epoch === this.epoch && scope === this.scope;
     const task = Promise.resolve().then(async () => {
       try {
-        const remote = parseThreadReadReceipts(await port.read(scope, signal));
+        const remote = parseThreadReadReceipts(await port.read(authority, signal));
         if (!current()) return;
         state.mergeReceipts(remote);
         // A cached confirmed receipt needs no repeated upload; uncertain writes are idempotent.
         for (const receipt of remote) this.unsent.delete(receipt);
         while (current() && this.unsent.size) {
           const batch = [...this.unsent].slice(0, 128);
-          const confirmed = parseThreadReadReceipts(await port.merge(scope, batch, signal));
+          const confirmed = parseThreadReadReceipts(await port.merge(authority, batch, signal));
           if (!current()) return;
           if (batch.some(receipt => !confirmed.includes(receipt))) throw new Error("Read receipt not confirmed");
           state.mergeReceipts(confirmed);
           for (const receipt of batch) this.unsent.delete(receipt);
         }
-        if (current()) this.persistCache(scope);
-      } catch { /* Keep the scoped cache/outbox; foreground/online refresh retries, without changing execution. */ }
+        if (current()) { this.persistCache(scope); this.failures = 0; }
+      } catch { if (current()) this.failures++; /* Keep the scoped cache/outbox; foreground/online refresh retries, without changing execution. */ }
       finally {
         if (current()) {
           const wasHydrated = this.hydrated;

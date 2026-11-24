@@ -22,6 +22,7 @@ import { createProjectAutomations } from "../project-automations.mjs";
 import { callConversationHost } from "../conversation-execution.mjs";
 import { ServerInformationStore, serverInformationHttp } from "../server-information.mjs";
 import { accountModelDefaultsHttp, humanActorAccess } from "../account-model-defaults-http.ts";
+import { threadReadReceiptsHttp } from "../thread-read-receipts-http.ts";
 import { ActorSshKeys, installationSshKeyAuthority } from "../actor-ssh-keys.ts";
 import { actorSshKeysHttp } from "../actor-ssh-keys-http.ts";
 
@@ -394,7 +395,7 @@ export function assembleInstallation({ serverStorage, identityFence, isHuman }) 
       });
       return { serverInformation, serverInformationService };
     },
-    /** Personal model defaults and personal SSH keys of the signed-in Human. */
+    /** Personal model defaults, cross-device read receipts and personal SSH keys of the signed-in Human. */
     async openPersonalServices({ sshLogin }) {
       const signedInHuman = humanActorAccess({
         authenticate: (request) => actorAccess.authenticate(request),
@@ -404,6 +405,7 @@ export function assembleInstallation({ serverStorage, identityFence, isHuman }) 
         trustedOrigin: (request) => actorAccess.options.trustedOrigin?.(request) ?? null,
       });
       const accountModelDefaultsService = accountModelDefaultsHttp(serverStorage.call, signedInHuman);
+      const threadReadReceiptsService = threadReadReceiptsHttp(serverStorage.call, signedInHuman);
       // Personal SSH keys: committed by the owner Worker, read from this thread's projection.
       const sshKeyAuthority = installationSshKeyAuthority({ actors: actorStore, access: instanceAccess });
       personalSshKeys = await ActorSshKeys.open(serverStorage.call, sshKeyAuthority);
@@ -414,7 +416,7 @@ export function assembleInstallation({ serverStorage, identityFence, isHuman }) 
         isHuman: (actorId) => actorStore.get(actorId)?.kind === "human",
         sshLogin,
       });
-      return { accountModelDefaultsService, personalSshKeys, actorSshKeysService };
+      return { accountModelDefaultsService, threadReadReceiptsService, personalSshKeys, actorSshKeysService };
     },
     /**
      * Turn push subscriptions for the two local hosts. The root's factories

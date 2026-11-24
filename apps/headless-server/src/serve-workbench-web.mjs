@@ -448,6 +448,7 @@ export async function createWorkbenchWebServer({
   turnPushService = null,
   serverInformationService = null,
   accountModelDefaultsService = null,
+  threadReadReceiptsService = null,
   actorSshKeysService = null,
   authService = null,
   accountService = null,
@@ -579,6 +580,11 @@ export async function createWorkbenchWebServer({
       // Personal model defaults verify the signed-in human Actor and its admission themselves.
       if (url.pathname === '/__opencraft_model_defaults') {
         if (accountModelDefaultsService && await serveNodeHttpExchange(request, response, accountModelDefaultsService)) return;
+        sendJson(response, 404, { error: 'missing' }); return;
+      }
+      // Cross-device read receipts verify the signed-in human Actor and its admission themselves.
+      if (url.pathname === '/__opencraft_thread_reads') {
+        if (threadReadReceiptsService && await serveNodeHttpExchange(request, response, threadReadReceiptsService)) return;
         sendJson(response, 404, { error: 'missing' }); return;
       }
       // Personal SSH keys verify the signed-in human Actor and its admission themselves.
