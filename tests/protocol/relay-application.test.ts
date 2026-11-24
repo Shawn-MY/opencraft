@@ -139,8 +139,8 @@ test('generic independently bundled application has no enterprise implementation
   const bundle = join(dir, 'application.mjs');
   const result = await build({ entryPoints: ['apps/relay-server/src/application.ts'], outfile: bundle, bundle: true, metafile: true,
     platform: 'node', format: 'esm', target: 'node24', banner: { js: "import {createRequire} from 'node:module';const require=createRequire(import.meta.url);" } });
-  // Relay starts the Hub state owner and nothing else, as its package ships it.
-  assert.deepEqual(await buildStartedOwnerWorkers(dir), ['hub-state-worker.mjs']);
+  // The Hub state owner uses the lock Worker to write its state document.
+  assert.deepEqual(await buildStartedOwnerWorkers(dir), ['hub-state-worker.mjs', 'lock-worker.mjs']);
   assert.deepEqual(await verifySiblingFiles(dir), []);
   const sourceRoots = ['apps/relay-server/src/', 'packages/', 'node_modules/'];
   assert.deepEqual(Object.keys(result.metafile!.inputs).filter(path => !sourceRoots.some(root => path.startsWith(root))), [],
@@ -161,7 +161,7 @@ test('the Relay package ships the owner Workers its bundles start and runs from 
   await writeFile(join(output, 'server-core-worker.mjs'), 'new Worker(new URL("./orchestration-runtime-worker.mjs", import.meta.url));');
   await packageRelay({ output });
   const owners = new Set(OWNER_WORKERS.map(([, file]: [string, string]) => file));
-  assert.deepEqual((await readdir(output)).filter(name => owners.has(name)), ['hub-state-worker.mjs']);
+  assert.deepEqual((await readdir(output)).filter(name => owners.has(name)).sort(), ['hub-state-worker.mjs', 'lock-worker.mjs']);
   assert.deepEqual(await verifySiblingFiles(output), []);
   const operator = join(dir, 'operator.json'); await writeFile(operator, JSON.stringify({ credential: token() }), { mode: 0o600 });
   const port = await freePort(), config = join(dir, 'relay.json');

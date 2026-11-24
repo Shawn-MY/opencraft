@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import lockfile from "proper-lockfile";
+import { lockFileExclusive } from "@opencraft/sqlite-node/locks";
 import {
   stateChangeOutcome,
   StateDocumentCorruptError,
@@ -39,13 +39,21 @@ function serialize<T>(file: string, run: () => Promise<T>): Promise<T> {
 
 /**
  * Node adapter: one pretty-printed JSON file per key in `directory`.
- * Updates take the same proper-lockfile lock the previous helpers used, so
- * processes on older and newer code still serialize on one file; updates in
- * one process queue first, so they never compete for the lock. Writes go
- * through a temporary file, fsync, rename and a directory fsync.
+ * Updates from different processes serialize on a kernel lock at
+ * `<file>.lock`: a SQLite exclusive transaction on a permanent private file,
+ * held by the `@opencraft/sqlite-node/locks` Worker so the caller's event loop
+ * does no synchronous IO; the former lease's retries and `ELOCKED` stay. It never
+ * expires while its holder lives, however long that holder's event loop
+ * stalls; it has no refresh timer; the holder's death releases it at once.
+ * Earlier releases leased the same path as a proper-lockfile directory: the
+ * lock file refuses those older updaters (they cannot create or remove it),
+ * and a leftover lease directory is converted only once it is far older than
+ * any refresh. Updates in one process queue first, so they never compete for
+ * the lock. Writes go through a temporary file, fsync, rename and a directory
+ * fsync.
  *
- * `lockfilePath` relocates the proper-lockfile lock (default `<file>.lock`)
- * for owners whose `<file>.lock` already holds another fence.
+ * `lockfilePath` relocates the lock (default `<file>.lock`) for owners whose
+ * `<file>.lock` already holds another fence.
  */
 export interface FileStateDocumentOptions {
   lockfilePath?(file: string): string;
@@ -120,11 +128,7 @@ export function fileStateDocumentStore(directory: string, options: FileStateDocu
       const target = path(key);
       return serialize(resolve(target), async () => {
         await mkdir(directory, { recursive: true, mode: 0o700 });
-        const release = await lockfile.lock(target, {
-          realpath: false,
-          retries: { retries: 20, minTimeout: 20, maxTimeout: 200 },
-          ...(options.lockfilePath ? { lockfilePath: options.lockfilePath(target) } : {}),
-        });
+        const release = await lockFileExclusive(resolve(options.lockfilePath?.(target) ?? `${target}.lock`));
         try {
           const outcome = stateChangeOutcome(change(await load(key)));
           if (outcome.json !== undefined) await commit(key, outcome.json);

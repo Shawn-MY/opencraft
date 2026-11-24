@@ -13,6 +13,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
 export const OWNER_WORKERS = Object.freeze([
   ["apps/opencraft-daemon/src/ssh-connections.worker.ts", "ssh-connections-worker.mjs"],
   ["packages/hub-network/src/hub-state.worker.ts", "hub-state-worker.mjs"],
+  ["packages/sqlite-node/src/lock.worker.ts", "lock-worker.mjs"],
   ["apps/personal-assistant/src/runtime/memory-browser-offline-worker.mjs", "memory-browser-offline-worker.mjs"],
   ["packages/storage-node/src/server/server-core-owner.worker.ts", "server-core-owner-worker.mjs"],
   ["apps/headless-server/src/server-core-worker.mjs", "server-core-worker.mjs"],

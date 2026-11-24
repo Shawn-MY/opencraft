@@ -238,8 +238,8 @@ export async function packageWebServer({ version, webRoot = join(repositoryRoot,
     await verifySiblingFiles(join(packageRoot, 'execution'), { nested: ['codex-bridge'], optional: { ...SOURCE_FALLBACK_SIBLINGS,
       'personal-git-worker.mjs': 'built into runtime/; the headless gateway is given that path (headless-gateway-application.mjs)' } });
   }
-  // The Relay and admin entries in runtime/ start only a few owners (the Hub state);
-  // build those beside them and check every runtime bundle's siblings shipped.
+  // Build the owners needed by the runtime bundles, including the Hub state
+  // Worker and its lock Worker, then verify every runtime sibling reference.
   await buildStartedOwnerWorkers(join(packageRoot, 'runtime'));
   await verifySiblingFiles(join(packageRoot, 'runtime'), { optional: SOURCE_FALLBACK_SIBLINGS });
   await chmod(join(packageRoot, 'runtime/cli.mjs'), 0o755);
