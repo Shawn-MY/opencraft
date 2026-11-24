@@ -53,6 +53,7 @@ import { SessionCapabilities } from "@opencraft/session-capabilities";
 import { SessionCapabilityMcp, capabilitySigningKey } from "@opencraft/session-capabilities/mcp";
 import { fileKeyMaterial, fileSecretStore } from "@opencraft/secret-storage/file";
 import { ConversationResourceLifecycle } from './conversation-resource-lifecycle.mjs';
+import { periodicOwnerWork, timeoutOwnerWake } from "@opencraft/owner-wake";
 import { ConversationResourceTransport } from './conversation-resource-transport.js';
 import { RemoteBrowserService } from './remote-browser-service.mjs';
 import { RemoteBrowserCapabilities } from './remote-browser/capabilities.ts';
@@ -458,6 +459,8 @@ export async function startHeadlessServer(options = {}, composition = {}) {
   // Node-only services; creating the module opens nothing, each step runs at
   // its original position and each disposer at its original shutdown step.
   const nodeLocal = assembleNodeLocal({ dataDirectory });
+  // Deployment-level periodic owner work runs on the owner wake-up port (gateway-split.md §4.2).
+  const ownerWake = options.ownerWake ?? timeoutOwnerWake();
   // Identity and admission over the core SQL owner opened above; creating it
   // opens nothing, each step and disposer keeps its original position.
   const installation = assembleInstallation({ serverStorage, identityFence,
@@ -470,7 +473,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       results.push(...await Promise.allSettled(disposers.map(dispose => Promise.resolve().then(dispose))));
     };
     capabilitiesReadyResolve();
-    clearInterval(resourceReconciliationTimer);
+    resourceReconciliationTimer?.close();
     await settle([() => lateConversationResources.current()?.close()]);
     let entryClosing;
     const closeEntry = () => entryClosing ??= settle([
@@ -1041,7 +1044,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
         await remoteBrowser.releaseThread(row.hostId, row.threadId);
       },
       ...(workspaceLifecycle ? {workspace:row=>workspaceLifecycle.releaseConversation(row)} : {}),
-    }, { diagnose: value => console.warn('[conversation-resources]', JSON.stringify(value)),
+    }, { diagnose: value => console.warn('[conversation-resources]', JSON.stringify(value)), wake: ownerWake,
       ...(workspaceLifecycle ? {dependencies:{workspace:['browser']},replayOwners:['browser','workspace']} : {}),
     }));
     if (remoteBrowser) remoteBrowser.conversationLifecycle = conversationResources;
@@ -1341,7 +1344,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       requireAccessKey: options.sshRequireAccessKey, appHost: appHostServer, sshServers,
     }));
     const observability = await nodeLocal.startObservability({ configFile: process.env.OPENCRAFT_OBSERVE_INGRESS_CONFIG,
-      access: instanceAccess, actors: actorStore, executionHealth: options.getExecutionHealth });
+      access: instanceAccess, actors: actorStore, executionHealth: options.getExecutionHealth, wake: ownerWake });
     fileDownloads = new HostFileDownloads(hostId => {
       if (hostId === "local-codex" && ownedWorkspaceRouting && !fileSystem) throw Error('Local Hands file downloads unavailable');
       if (hostId === "opencraft-server" || hostId === "local-codex") return fileSystem ?? "local";
@@ -1361,6 +1364,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       instanceId: options.isolateBrowserStorage ? machineIdentity.machineId : null,
       assetVersion: options.isolateBrowserStorage ? webRelease.buildId : null,
       observability,
+      ownerWake,
       getExecutionHealth: options.getExecutionHealth,
       getHostReadiness: () => codexReadiness ? { "local-codex": codexReadiness.snapshot() } : {},
       createAppServerAccessSession: (context, emit) => createThreadAccessSession("opencraft-server", context, emit),
@@ -1463,7 +1467,7 @@ export async function startHeadlessServer(options = {}, composition = {}) {
       finally { resourceInventoryRunning = false; }
     };
     void reconcileResources();
-    resourceReconciliationTimer = setInterval(() => { void reconcileResources(); }, 60_000); resourceReconciliationTimer.unref();
+    resourceReconciliationTimer = periodicOwnerWork(ownerWake, 60_000, () => { void reconcileResources(); });
     const listenHost = options.listenHost ?? host;
     if (!["127.0.0.1", "0.0.0.0"].includes(listenHost)) throw new Error("Invalid listener host");
     let address;
