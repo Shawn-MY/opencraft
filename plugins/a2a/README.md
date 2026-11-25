@@ -11,6 +11,11 @@ listener, issue a credential or enable a route.
 
 ## Gateway
 
+Use a dedicated Codex conversation created through the authenticated
+`thread/start` API with `historyMode: "paginated"`. The current native runtime
+provides bounded Turn/Item pages for that history format. Existing legacy-format
+histories cannot supply completion artifacts through this interface.
+
 Create a dedicated Session Actor through existing Actor management. Add it to
 the conversation's Server space and explicitly grant `conversation.read`,
 `message.send` and `execution.queue` on that conversation. Issue a limited
