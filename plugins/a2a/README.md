@@ -55,6 +55,11 @@ Hosts without that evidence leave the outcome unconfirmed. A reply is bounded
 by the native completion projection; `artifacts[].metadata.truncated` signals
 truncation. The plugin creates no execution queue or task database.
 
+Codex conversations support completion artifacts through both the provider
+bridge and the legacy Host. Native Pi/DSH input adapters currently expose queue
+state without a completion projection, so they cannot confirm a completed A2A
+reply.
+
 ## Relay
 
 If a Relay fronts the installation, add the exported adapter to its existing
